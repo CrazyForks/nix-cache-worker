@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { app } from "../src/app";
-import { createDeletionJob, runQueuedJobs } from "../src/jobs/jobs";
+import { createDeletionJob, runQueuedJobs, scheduleGcJob } from "../src/jobs/jobs";
 import { claimObjectWrite, releaseObjectWrite } from "../src/storage/r2";
 import type { Bindings } from "../src/env";
 import { homePage } from "../src/ui/home";
@@ -111,7 +111,13 @@ describe("Admin console page", () => {
     expect(html).toContain('aria-pressed="true"');
     expect(html).toContain("let groupByTags = true");
     expect(html).toContain("function tagGroupLabel(tags)");
-    expect(html).toContain('const formatDaysLeft = (value) => value + (value === 1 ? " day left" : " days left");');
+    expect(html).toContain('hourCycle: "h23"');
+    expect(html).toContain("const formatRetentionRemaining = (value)");
+    expect(html).toContain('return "Expired"');
+    expect(html).toContain('className = remainingSeconds < 0 ? "expired" : ""');
+    expect(html).toContain("waitForJob(jobId)");
+    expect(html).toContain('result.reused ? "GC already scheduled · " : "GC started · "');
+    expect(html).toContain('setMessage("GC scan completed · queued deletions may continue", "success")');
     expect(html).toContain("No tags");
     expect(html).not.toContain('id="guide"');
     expect(html).toContain('id="publishing"');
@@ -357,6 +363,7 @@ describe("Nix cache HTTP API", () => {
       { versionName: "recent-1", registeredAt: new Date(now - 3 * 60 * 60 * 1000).toISOString() },
       { versionName: "recent-2", registeredAt: new Date(now - 2 * 60 * 60 * 1000).toISOString() },
       { versionName: "recent-3", registeredAt: new Date(now - 60 * 60 * 1000).toISOString() },
+      { versionName: "expired", registeredAt: new Date(now - 4 * 24 * 60 * 60 * 1000).toISOString() },
     ];
     for (const version of versions) {
       await testEnv.DB.prepare(
@@ -365,11 +372,15 @@ describe("Nix cache HTTP API", () => {
     }
     const response = await request(`/api/admin/packages/${packageName}`, { headers: bearer("admin-secret") });
     expect(response.response.status).toBe(200);
-    const body = await response.response.json<{ versions: Array<{ versionName: string; retentionState: string; retentionRemainingDays: number | null; protectedByKeepLatest: boolean }> }>();
+    const body = await response.response.json<{ versions: Array<{ versionName: string; retentionState: string; retentionRemainingDays: number | null; retentionRemainingSeconds: number | null; protectedByKeepLatest: boolean }> }>();
     const aging = body.versions.find((version) => version.versionName === "aging");
     const protectedVersion = body.versions.find((version) => version.versionName === "recent-3");
+    const expired = body.versions.find((version) => version.versionName === "expired");
     expect(aging).toMatchObject({ retentionState: "3 days", retentionRemainingDays: 2 });
+    expect(aging?.retentionRemainingSeconds).toBeGreaterThan(129500);
+    expect(aging?.retentionRemainingSeconds).toBeLessThan(129700);
     expect(protectedVersion).toMatchObject({ protectedByKeepLatest: true, retentionState: "persistent", retentionRemainingDays: null });
+    expect(expired?.retentionRemainingSeconds).toBeLessThan(0);
   });
 
   it("exposes package, version, and file hierarchy and targets version operations", async () => {
@@ -483,6 +494,18 @@ describe("Nix cache HTTP API", () => {
     expect(payload[0]).toBeUndefined();
   });
 
+  it("reuses an active GC job and drains manual GC work", async () => {
+    const scheduled = await scheduleGcJob(testEnv, "test", { reason: "test" });
+    const manual = await request("/api/admin/gc", { method: "POST", headers: bearer("admin-secret") });
+    const body = await manual.response.json<{ jobId: string; reused: boolean }>();
+    expect(manual.response.status).toBe(202);
+    expect(body).toMatchObject({ jobId: scheduled.id, reused: true });
+    await Promise.all(manual.waitUntil);
+    expect((await testEnv.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(scheduled.id).first<{ status: string }>())?.status).toBe("completed");
+    const activeGcJobs = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM jobs WHERE type = 'gc' AND status IN ('queued', 'running', 'failed')").first<{ count: number }>();
+    expect(Number(activeGcJobs?.count ?? 0)).toBe(0);
+  });
+
   it("resumes deletion when objects are already marked deleting", async () => {
     const pair = await uploadPair("deleting-retry");
     const registration = await register("deleting-retry-package", "v1", [pair.narinfoKey]);
@@ -540,7 +563,6 @@ describe("Nix cache HTTP API", () => {
       .bind(new Date(base).toISOString(), "gc-package", "beta-only").run();
     const gc = await request("/api/admin/gc", { method: "POST", headers: bearer("admin-secret") });
     await Promise.all(gc.waitUntil);
-    await runQueuedJobs(testEnv, 10);
     const latest = await request("/api/admin/packages/gc-package/versions/newest", { headers: bearer("admin-secret") });
     expect(latest.response.status).toBe(200);
     expect((await request("/api/admin/packages/gc-package/versions/old", { headers: bearer("admin-secret") })).response.status).toBe(404);

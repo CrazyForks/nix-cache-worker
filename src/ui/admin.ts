@@ -97,6 +97,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     .tag { color: #b9d7c3; background: #263b30; border-radius: 5px; padding: 2px 6px; font-size: 11px; }
     .muted { color: var(--muted); }
     .retention { color: var(--amber); }
+    .expired { color: var(--red); }
     .persistent { color: var(--green); }
     .file-row td { padding: 6px 10px 10px 52px; color: var(--muted); background: #121817; }
     .file-list { display: grid; gap: 4px; }
@@ -247,13 +248,16 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     const setMessage = (text, type = "") => { const el = $("message"); el.textContent = text; el.className = "message" + (type ? " " + type : ""); };
     const setLoginMessage = (text, type = "") => { const el = $("loginMessage"); el.textContent = text; el.className = "message" + (type ? " " + type : ""); };
     const formatBytes = (value) => { const bytes = Number(value) || 0; if (bytes < 1024) return bytes + " B"; const units = ["KB", "MB", "GB", "TB"]; let size = bytes; let index = -1; do { size /= 1024; index += 1; } while (size >= 1024 && index < units.length - 1); return size.toFixed(size >= 10 ? 0 : 1) + " " + units[index]; };
-    const formatDate = (value) => { try { return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(new Date(value)); } catch { return value || "—"; } };
+    const formatDate = (value) => { try { return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(new Date(value)); } catch { return value || "—"; } };
     const formatDaysLeft = (value) => value + (value === 1 ? " day left" : " days left");
+    const formatRetentionRemaining = (value) => { const seconds = Number(value); if (!Number.isFinite(seconds)) return ""; if (seconds < 0) return "Expired"; if (seconds >= 86400) return formatDaysLeft(Math.ceil(seconds / 86400)); if (seconds >= 3600) return Math.ceil(seconds / 3600) + (Math.ceil(seconds / 3600) === 1 ? " hour left" : " hours left"); if (seconds >= 60) return Math.ceil(seconds / 60) + (Math.ceil(seconds / 60) === 1 ? " minute left" : " minutes left"); return seconds + (seconds === 1 ? " second left" : " seconds left"); };
     const optionalNumber = (value) => value === "" ? null : Number(value);
     function readStoredToken() { try { return window.sessionStorage.getItem(tokenStorageKey) || ""; } catch { return ""; } }
     function storeToken(value) { try { window.sessionStorage.setItem(tokenStorageKey, value); } catch {} }
     function clearStoredToken() { try { window.sessionStorage.removeItem(tokenStorageKey); } catch {} }
     async function api(path, options = {}) { const headers = new Headers(options.headers || {}); headers.set("Authorization", "Bearer " + token); if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json"); const response = await fetch(path, { ...options, headers }); const text = await response.text(); let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = text; } if (!response.ok) throw new Error(data?.error?.message || response.statusText); return data; }
+    const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+    async function waitForJob(jobId) { for (let attempt = 0; attempt < 20; attempt += 1) { await delay(1000); const job = await api("/api/admin/jobs/" + encodeURIComponent(jobId)); if (job.status === "completed") return job; if (job.status === "failed") throw new Error(job.last_error || "GC job failed"); } return null; }
     function tagsNode(tags) { const list = document.createElement("div"); list.className = "tag-list"; const entries = Object.entries(tags || {}); if (!entries.length) { const empty = document.createElement("span"); empty.className = "muted"; empty.textContent = "No tags"; list.append(empty); } for (const [key, value] of entries) { const tag = document.createElement("span"); tag.className = "tag"; tag.textContent = key + "=" + value; list.append(tag); } return list; }
     function button(label, className, onClick) { const item = document.createElement("button"); item.type = "button"; item.className = "button small " + (className || ""); item.textContent = label; item.onclick = onClick; return item; }
     function cell(value = "—") { const item = document.createElement("td"); item.textContent = value; return item; }
@@ -318,7 +322,13 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
           const retention = document.createElement("td");
           retention.className = version.retentionState === "persistent" ? "persistent" : "retention";
           retention.textContent = version.retentionState;
-          if (version.retentionRemainingDays !== null && version.retentionRemainingDays !== undefined) {
+          if (version.retentionRemainingSeconds !== null && version.retentionRemainingSeconds !== undefined) {
+            const remainingSeconds = Number(version.retentionRemainingSeconds);
+            const remaining = document.createElement("span");
+            remaining.className = remainingSeconds < 0 ? "expired" : "";
+            remaining.textContent = formatRetentionRemaining(remainingSeconds);
+            retention.append(document.createElement("br"), remaining);
+          } else if (version.retentionRemainingDays !== null && version.retentionRemainingDays !== undefined) {
             retention.append(document.createElement("br"), document.createTextNode(formatDaysLeft(version.retentionRemainingDays)));
           }
           versionRow.append(retention);
@@ -582,7 +592,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     $("login").onclick = () => openConsole($("token").value);
     $("token").onkeydown = (event) => { if (event.key === "Enter") $("login").click(); };
     $("refresh").onclick = () => load(); $("query").onkeydown = (event) => { if (event.key === "Enter") load(); };
-    $("gc").onclick = async () => { try { const result = await api("/api/admin/gc", { method: "POST" }); setMessage("GC job queued · " + result.jobId, "success"); } catch (error) { setMessage(error.message, "error"); } };
+    $("gc").onclick = async () => { $("gc").disabled = true; try { const result = await api("/api/admin/gc", { method: "POST" }); setMessage((result.reused ? "GC already scheduled · " : "GC started · ") + result.jobId, "success"); const job = await waitForJob(result.jobId); if (job) { setMessage("GC scan completed · queued deletions may continue", "success"); await load(); } else setMessage("GC is still running; refresh again shortly", "success"); } catch (error) { setMessage(error.message, "error"); } finally { $("gc").disabled = false; } };
     $("saveSettings").onclick = async () => { try { await api("/api/admin/settings", { method: "PUT", body: JSON.stringify({ store_dir: $("store_dir").value, priority: $("priority").value, want_mass_query: $("want_mass_query").value, default_retention_days: $("default_retention_days").value }) }); setMessage("Cache settings saved", "success"); } catch (error) { setMessage(error.message, "error"); } };
     $("savePolicy").onclick = async () => { try { const draft = readPolicyDraft(); const payload = { name: $("policy_name").value.trim(), ...draft }; await api(editingPolicyId == null ? "/api/admin/policies" : "/api/admin/policies/" + editingPolicyId, { method: editingPolicyId == null ? "POST" : "PUT", body: JSON.stringify(payload) }); closePolicyEditor(); setMessage("Retention rule saved", "success"); await load(); } catch (error) { setMessage(error.message, "error"); } };
     $("togglePolicyEditor").onclick = () => openPolicyEditor();

@@ -16,7 +16,7 @@ import {
   type RetentionOperator,
 } from "../domain/policy";
 import { emitAudit } from "../observability";
-import { getJob, createJob, createDeletionJob, findActiveDeletionJob, runJob } from "../jobs/jobs";
+import { getJob, createDeletionJob, findActiveDeletionJob, runQueuedJobs, scheduleGcJob, runJob } from "../jobs/jobs";
 import { bumpCacheGeneration, getSetting, getVersion, now, parseTags, type VersionRow } from "../storage/db";
 import { serializeVersion, validateNonNegativeInteger, validatePackageName, validateTags, validateVersionName } from "./versions";
 import { requireRole } from "../middleware/auth";
@@ -32,10 +32,16 @@ type FileRow = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const SECOND_MS = 1000;
 
 function remainingRetentionDays(row: VersionRow, durationDays: number): number {
   const expiresAt = Date.parse(row.registered_at) + durationDays * DAY_MS;
   return Math.max(0, Math.ceil((expiresAt - Date.now()) / DAY_MS));
+}
+
+function remainingRetentionSeconds(row: VersionRow, durationDays: number): number {
+  const remaining = (Date.parse(row.registered_at) + durationDays * DAY_MS - Date.now()) / SECOND_MS;
+  return remaining < 0 ? Math.floor(remaining) : Math.ceil(remaining);
 }
 
 async function loadPolicies(env: AppEnv["Bindings"]): Promise<PolicyRow[]> {
@@ -128,6 +134,7 @@ async function versionSummary(
     protectedByKeepLatest,
     retentionState: isPersistent ? "persistent" : `${retentionDays} days`,
     retentionRemainingDays: isPersistent ? null : remainingRetentionDays(row, retentionDays),
+    retentionRemainingSeconds: isPersistent ? null : remainingRetentionSeconds(row, retentionDays),
   };
   if (includeFiles) result.files = files;
   return result;
@@ -386,10 +393,10 @@ adminRoutes.get("/api/admin/jobs/:jobId", async (c) => {
 });
 
 adminRoutes.post("/api/admin/gc", async (c) => {
-  const jobId = await createJob(c.env, "gc", null, c.get("role"), { reason: "manual" });
-  await emitAudit(c.env, "gc_requested", c.get("role"), null, { jobId });
-  c.executionCtx.waitUntil(runJob(c.env, jobId));
-  return c.json({ jobId, status: "queued" }, 202);
+  const scheduled = await scheduleGcJob(c.env, c.get("role"), { reason: "manual" });
+  await emitAudit(c.env, "gc_requested", c.get("role"), null, { jobId: scheduled.id, reused: !scheduled.created });
+  c.executionCtx.waitUntil(runQueuedJobs(c.env, 4, 8));
+  return c.json({ jobId: scheduled.id, status: scheduled.status, reused: !scheduled.created }, 202);
 });
 
 type PolicyPayload = {
