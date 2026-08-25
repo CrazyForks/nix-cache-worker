@@ -457,6 +457,34 @@ describe("Nix cache HTTP API", () => {
     expect(body.versions.find((version) => version.versionName === "v4")).toMatchObject({ capacityExceeded: false, protectedByKeepLatest: true });
   });
 
+  it("reports capacity overage when overlapping capacity groups disagree", async () => {
+    const packageName = "overlapping-capacity-display-package";
+    const now = Date.now();
+    for (let index = 0; index < 4; index += 1) {
+      const registeredAt = new Date(now - (4 - index) * 1000).toISOString();
+      await testEnv.DB.prepare(
+        "INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, retention_days, registered_at, updated_at, state) VALUES (?, ?, ?, '{\"channel\":\"stable\"}', 30, ?, ?, 'active')",
+      ).bind(`${packageName}-v${index}`, packageName, `v${index}`, registeredAt, registeredAt).run();
+    }
+    for (const [name, groupBy, capacityVersions] of [
+      ["overlap-package-capacity-rule", ["pkg_name"], 2],
+      ["overlap-channel-capacity-rule", ["pkg_tag:channel"], 100],
+    ] as const) {
+      const policy = await request("/api/admin/policies", {
+        method: "POST",
+        headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+        body: JSON.stringify({ name, conditions: [{ field: "pkg_name", operator: "equals", value: packageName, negate: false }], groupBy, lastN: null, durationDays: null, capacityVersions }),
+      });
+      expect(policy.response.status).toBe(201);
+    }
+
+    const response = await request(`/api/admin/packages/${packageName}`, { headers: bearer("admin-secret") });
+    expect(response.response.status).toBe(200);
+    const body = await response.response.json<{ versions: Array<{ versionName: string; capacityExceeded: boolean; protectedByKeepLatest: boolean }> }>();
+    expect(body.versions.find((version) => version.versionName === "v0")).toMatchObject({ capacityExceeded: true, protectedByKeepLatest: false });
+    expect(body.versions.find((version) => version.versionName === "v3")).toMatchObject({ capacityExceeded: false, protectedByKeepLatest: true });
+  });
+
   it("exposes package, version, and file hierarchy and targets version operations", async () => {
     const first = await uploadPair("hierarchy-v1");
     const second = await uploadPair("hierarchy-v2");

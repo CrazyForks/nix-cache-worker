@@ -104,6 +104,25 @@ async function pruneGcMatches(env: Bindings, jobId: string): Promise<void> {
   ).bind(jobId, jobId).run();
 }
 
+async function pruneGcCapacityMatches(env: Bindings, jobId: string): Promise<void> {
+  await env.DB.prepare(
+    `DELETE FROM gc_policy_capacity_matches
+     WHERE job_id = ? AND rowid IN (
+       SELECT rowid FROM (
+         SELECT m.rowid,
+                ROW_NUMBER() OVER (
+                  PARTITION BY m.policy_id, m.group_key
+                  ORDER BY m.registered_at DESC, m.version_id DESC
+                ) AS position,
+                m.capacity_versions
+         FROM gc_policy_capacity_matches m
+         WHERE m.job_id = ?
+       ) ranked
+       WHERE ranked.position <= ranked.capacity_versions
+     )`,
+  ).bind(jobId, jobId).run();
+}
+
 async function protectedVersionIds(env: Bindings, jobId: string, versions: VersionRow[]): Promise<Set<string>> {
   if (!versions.length) return new Set();
   const protectedIds = new Set<string>();
@@ -126,18 +145,8 @@ async function capacityExcessVersionIds(env: Bindings, jobId: string, versions: 
     const batch = versions.slice(offset, offset + GC_VERSION_QUERY_BATCH_SIZE);
     const placeholders = batch.map(() => "?").join(",");
     const result = await env.DB.prepare(
-      `SELECT version_id FROM (
-         SELECT version_id,
-                capacity_versions,
-                ROW_NUMBER() OVER (
-                  PARTITION BY policy_id, group_key
-                  ORDER BY registered_at DESC, version_id DESC
-                ) AS position
-         FROM gc_policy_capacity_matches
-         WHERE job_id = ?
-       ) ranked
-       WHERE position > capacity_versions
-         AND version_id IN (${placeholders})`,
+      `SELECT DISTINCT version_id FROM gc_policy_capacity_matches
+       WHERE job_id = ? AND version_id IN (${placeholders})`,
     ).bind(jobId, ...batch.map((row) => row.version_id)).all<{ version_id: string }>();
     for (const row of result.results) capacityExcessIds.add(row.version_id);
   }
@@ -183,6 +192,7 @@ export async function processGc(env: Bindings, jobId: string): Promise<void> {
       return;
     }
     await pruneGcMatches(env, jobId);
+    await pruneGcCapacityMatches(env, jobId);
     await updateJob(env, jobId, { ...payload, policySnapshot: policies, phase: "evaluate", lastVersionId: "" }, "queued");
     return;
   }

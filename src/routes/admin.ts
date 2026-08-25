@@ -234,15 +234,18 @@ async function capacityExceededVersionIdsForRows(env: AppEnv["Bindings"], rows: 
     lastVersionId = page.results[page.results.length - 1].version_id;
   }
 
-  const keptIds = new Set<string>();
-  for (const list of newest.values()) for (const item of list) keptIds.add(item.versionId);
+  const keptByTarget = new Map<string, Set<string>>();
+  for (const [targetKey, list] of newest) {
+    keptByTarget.set(targetKey, new Set(list.map((item) => item.versionId)));
+  }
   const exceededIds = new Set<string>();
   for (const row of rows) {
-    if (row.state !== "active" || keptIds.has(row.version_id)) continue;
+    if (row.state !== "active") continue;
     for (const policy of matchingPolicies(row, policies)) {
       const fields = policyGroupBy(policy);
       if (policy.capacity_versions == null || !fields) continue;
-      if (targets.has(`${policy.id}:${groupKey(row, fields)}`)) {
+      const targetKey = `${policy.id}:${groupKey(row, fields)}`;
+      if (targets.has(targetKey) && !keptByTarget.get(targetKey)?.has(row.version_id)) {
         exceededIds.add(row.version_id);
         break;
       }

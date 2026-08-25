@@ -58,9 +58,11 @@ limit. Overlapping capacity rules are enforced independently; a version is a
 capacity candidate if it is beyond the limit of any matching policy/group.
 
 GC persists capacity matches in a job-scoped table during the protect phase.
-The evaluate phase uses a window rank over the persisted snapshot to identify
-capacity-overage versions on each bounded page. The policy snapshot already
-stored in the GC job remains authoritative for the complete run.
+After the complete snapshot is collected, one window-ranking pass removes the
+within-capacity rows, leaving only capacity-overage matches. The evaluate phase
+then uses indexed lookups over that materialized candidate set on each bounded
+page. The policy snapshot already stored in the GC job remains authoritative
+for the complete run.
 
 ## Invariants and security
 
@@ -104,6 +106,6 @@ early cleanup eligibility.
 ## Implementation notes
 
 Implemented on the `codex/retention-group-capacity` branch with the nullable
-policy column, resumable capacity-match table, bounded D1 query chunks, admin
-API/UI support, documentation, and GC regression coverage. No implementation
-deviations from this RFC were required.
+policy column, resumable capacity-match table, materialized capacity candidates,
+bounded D1 query chunks, admin API/UI support, documentation, and GC regression
+coverage. No implementation deviations from this RFC were required.
