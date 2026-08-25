@@ -120,6 +120,10 @@ describe("Admin console page", () => {
     expect(html.indexOf('id="lastNCard"')).toBeLessThan(html.indexOf('id="capacityCard"'));
     expect(html.indexOf('id="capacityCard"')).toBeLessThan(html.indexOf('id="durationCard"'));
     expect(html).toContain("grid-template-columns: repeat(3, minmax(0, 1fr))");
+    expect(html).toContain('id="policy_duration" type="number" min="0" placeholder=""');
+    expect(html).toContain("function setDurationDefault(value)");
+    expect(html).toContain("setDurationDefault(settings.default_retention_days)");
+    expect(html).not.toContain('id="policy_duration" type="number" min="0" placeholder="30"');
     expect(html).toContain('hourCycle: "h23"');
     expect(html).toContain("const formatRetentionRemaining = (value)");
     expect(html).toContain('return "Expired"');

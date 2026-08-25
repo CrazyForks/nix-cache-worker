@@ -206,7 +206,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
             <div class="action-grid">
               <div class="action-card" id="lastNCard"><label class="action-toggle"><input id="enableLastN" type="checkbox"> Keep newest versions</label><div class="action-input"><input id="policy_last_n" type="number" min="0" placeholder="3" disabled><span class="unit">versions per group</span></div><p>Protected versions are never removed by automatic GC.</p></div>
               <div class="action-card" id="capacityCard"><label class="action-toggle"><input id="enableCapacity" type="checkbox"> Allow up to</label><div class="action-input"><input id="policy_capacity" type="number" min="0" placeholder="20" disabled><span class="unit">versions per group</span></div><p>Over-capacity versions may be removed before the duration expires.</p></div>
-              <div class="action-card" id="durationCard"><label class="action-toggle"><input id="enableDuration" type="checkbox"> Retain older versions for</label><div class="action-input"><input id="policy_duration" type="number" min="0" placeholder="30" disabled><span class="unit">days</span></div><p>Older unprotected versions become eligible after this age.</p></div>
+              <div class="action-card" id="durationCard"><label class="action-toggle"><input id="enableDuration" type="checkbox"> Retain older versions for</label><div class="action-input"><input id="policy_duration" type="number" min="0" placeholder="" disabled><span class="unit">days</span></div><p>Older unprotected versions become eligible after this age.</p></div>
             </div>
           </div>
           <div class="rule-preview" id="policyPreview">Configure an action to preview this rule.</div>
@@ -509,6 +509,10 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
         capacityVersions: $("enableCapacity").checked ? optionalNumber($("policy_capacity").value) : null,
       };
     }
+    function setDurationDefault(value) {
+      const defaultValue = String(value ?? "").trim() || "7";
+      $("policy_duration").placeholder = defaultValue;
+    }
     function updateActionCards() {
       const lastNEnabled = $("enableLastN").checked;
       const durationEnabled = $("enableDuration").checked;
@@ -516,6 +520,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
       $("policy_last_n").disabled = !lastNEnabled;
       $("policy_duration").disabled = !durationEnabled;
       $("policy_capacity").disabled = !capacityEnabled;
+      if (durationEnabled && !$("policy_duration").value) $("policy_duration").value = $("policy_duration").placeholder;
       $("lastNCard").classList.toggle("disabled", !lastNEnabled);
       $("durationCard").classList.toggle("disabled", !durationEnabled);
       $("capacityCard").classList.toggle("disabled", !capacityEnabled);
@@ -596,13 +601,13 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
         list.append(item);
       }
     }
-    async function load() { try { const [packages, overview, settings, policies] = await Promise.all([api("/api/admin/packages?q=" + encodeURIComponent($("query").value)), api("/api/admin/overview"), api("/api/admin/settings"), api("/api/admin/policies")]); renderStats(overview); packagesData = packages; renderPackages(packages); renderPolicies(policies); for (const key of ["store_dir", "priority", "want_mass_query", "default_retention_days"]) $(key).value = settings[key] || ""; setMessage("Showing " + packages.items.length + " of " + packages.total + " packages", "success"); } catch (error) { setMessage(error.message, "error"); throw error; } }
+    async function load() { try { const [packages, overview, settings, policies] = await Promise.all([api("/api/admin/packages?q=" + encodeURIComponent($("query").value)), api("/api/admin/overview"), api("/api/admin/settings"), api("/api/admin/policies")]); renderStats(overview); packagesData = packages; renderPackages(packages); renderPolicies(policies); for (const key of ["store_dir", "priority", "want_mass_query", "default_retention_days"]) $(key).value = settings[key] || ""; setDurationDefault(settings.default_retention_days); setMessage("Showing " + packages.items.length + " of " + packages.total + " packages", "success"); } catch (error) { setMessage(error.message, "error"); throw error; } }
     async function openConsole(candidate) { token = candidate.trim(); if (!token) return; $("login").disabled = true; try { await api("/api/admin/settings"); storeToken(token); $("token").value = ""; $("loginPanel").classList.add("hidden"); $("appShell").classList.remove("hidden"); await load(); } catch (error) { clearStoredToken(); token = ""; $("loginPanel").classList.remove("hidden"); $("appShell").classList.add("hidden"); setLoginMessage(error.message, "error"); } finally { $("login").disabled = false; } }
     $("login").onclick = () => openConsole($("token").value);
     $("token").onkeydown = (event) => { if (event.key === "Enter") $("login").click(); };
     $("refresh").onclick = () => load(); $("query").onkeydown = (event) => { if (event.key === "Enter") load(); };
     $("gc").onclick = async () => { $("gc").disabled = true; try { const result = await api("/api/admin/gc", { method: "POST" }); setMessage((result.reused ? "GC already scheduled · " : "GC started · ") + result.jobId, "success"); const job = await waitForJob(result.jobId); if (job) { setMessage("GC scan completed · queued deletions may continue", "success"); await load(); } else setMessage("GC is still running; refresh again shortly", "success"); } catch (error) { setMessage(error.message, "error"); } finally { $("gc").disabled = false; } };
-    $("saveSettings").onclick = async () => { try { await api("/api/admin/settings", { method: "PUT", body: JSON.stringify({ store_dir: $("store_dir").value, priority: $("priority").value, want_mass_query: $("want_mass_query").value, default_retention_days: $("default_retention_days").value }) }); setMessage("Cache settings saved", "success"); } catch (error) { setMessage(error.message, "error"); } };
+    $("saveSettings").onclick = async () => { try { await api("/api/admin/settings", { method: "PUT", body: JSON.stringify({ store_dir: $("store_dir").value, priority: $("priority").value, want_mass_query: $("want_mass_query").value, default_retention_days: $("default_retention_days").value }) }); setDurationDefault($("default_retention_days").value); setMessage("Cache settings saved", "success"); } catch (error) { setMessage(error.message, "error"); } };
     $("savePolicy").onclick = async () => { try { const draft = readPolicyDraft(); const payload = { name: $("policy_name").value.trim(), ...draft }; await api(editingPolicyId == null ? "/api/admin/policies" : "/api/admin/policies/" + editingPolicyId, { method: editingPolicyId == null ? "POST" : "PUT", body: JSON.stringify(payload) }); closePolicyEditor(); setMessage("Retention rule saved", "success"); await load(); } catch (error) { setMessage(error.message, "error"); } };
     $("togglePolicyEditor").onclick = () => openPolicyEditor();
     $("cancelPolicy").onclick = closePolicyEditor;
