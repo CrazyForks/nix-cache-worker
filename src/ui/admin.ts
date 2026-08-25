@@ -130,7 +130,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     .group-row select, .group-row input { width: auto; padding: 6px 8px; }
     .group-row input { max-width: 120px; }
     .group-row .button { border: 0; padding: 5px 7px; }
-    .action-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .action-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
     .action-card { border: 1px solid var(--line); border-radius: 10px; padding: 13px; background: rgba(23, 27, 27, .62); }
     .action-card.disabled { opacity: .58; }
     .action-card p { color: var(--muted); margin: 8px 0 0; font-size: 12px; }
@@ -202,11 +202,11 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
           </div>
 
           <div class="rule-block">
-            <div class="rule-block-head"><div><span class="step-index">3</span><h3>Set retention actions</h3><p>Enable one or both actions. Duration is measured from version registration.</p></div></div>
+            <div class="rule-block-head"><div><span class="step-index">3</span><h3>Set retention actions</h3><p>Enable any combination. Priority is left to right: earlier actions take precedence over later ones. Pins always override automatic GC.</p></div></div>
             <div class="action-grid">
               <div class="action-card" id="lastNCard"><label class="action-toggle"><input id="enableLastN" type="checkbox"> Keep newest versions</label><div class="action-input"><input id="policy_last_n" type="number" min="0" placeholder="3" disabled><span class="unit">versions per group</span></div><p>Protected versions are never removed by automatic GC.</p></div>
-              <div class="action-card" id="durationCard"><label class="action-toggle"><input id="enableDuration" type="checkbox"> Retain older versions for</label><div class="action-input"><input id="policy_duration" type="number" min="0" placeholder="30" disabled><span class="unit">days</span></div><p>Older unprotected versions become eligible after this age.</p></div>
               <div class="action-card" id="capacityCard"><label class="action-toggle"><input id="enableCapacity" type="checkbox"> Allow up to</label><div class="action-input"><input id="policy_capacity" type="number" min="0" placeholder="20" disabled><span class="unit">versions per group</span></div><p>Over-capacity versions may be removed before the duration expires.</p></div>
+              <div class="action-card" id="durationCard"><label class="action-toggle"><input id="enableDuration" type="checkbox"> Retain older versions for</label><div class="action-input"><input id="policy_duration" type="number" min="0" placeholder="30" disabled><span class="unit">days</span></div><p>Older unprotected versions become eligible after this age.</p></div>
             </div>
           </div>
           <div class="rule-preview" id="policyPreview">Configure an action to preview this rule.</div>

@@ -116,6 +116,10 @@ describe("Admin console page", () => {
     expect(html).toContain('id="enableCapacity"');
     expect(html).toContain("capacityVersions");
     expect(html).toContain("Over-capacity versions may be removed before the duration expires.");
+    expect(html).toContain("Priority is left to right: earlier actions take precedence over later ones.");
+    expect(html.indexOf('id="lastNCard"')).toBeLessThan(html.indexOf('id="capacityCard"'));
+    expect(html.indexOf('id="capacityCard"')).toBeLessThan(html.indexOf('id="durationCard"'));
+    expect(html).toContain("grid-template-columns: repeat(3, minmax(0, 1fr))");
     expect(html).toContain('hourCycle: "h23"');
     expect(html).toContain("const formatRetentionRemaining = (value)");
     expect(html).toContain('return "Expired"');
