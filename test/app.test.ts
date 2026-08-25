@@ -131,6 +131,12 @@ describe("Admin console page", () => {
     expect(html).toContain("capacityExceeded");
     expect(html).toContain("GC eligible · capacity exceeded");
     expect(html).toContain(".gc-eligible { color: var(--red)");
+    expect(html).toContain("group-toggle");
+    expect(html).toContain("version-toggle");
+    expect(html).toContain("toggleFiles(detailRow");
+    expect(html).not.toContain("Click Files to inspect this version's cache files.");
+    expect(html).toContain("Extend");
+    expect(html).toContain("retention-editor");
     expect(html).toContain("waitForJob(jobId)");
     expect(html).toContain('result.reused ? "GC already scheduled · " : "GC started · "');
     expect(html).toContain('setMessage("GC scan completed · queued deletions may continue", "success")');

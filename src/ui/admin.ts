@@ -80,6 +80,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     .publisher-code { margin: 13px 0 0 31px; padding: 10px 11px; overflow-x: auto; color: #d8f2df; background: #0c1210; border: 1px solid #2e493d; border-radius: 8px; white-space: pre-wrap; word-break: break-word; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
     .toolbar, .actions, .form-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .actions { position: relative; }
     .toolbar input { max-width: 330px; }
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; min-width: 920px; }
@@ -100,6 +101,8 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     .expired { color: var(--red); }
     .gc-eligible { color: var(--red); font-weight: 700; }
     .persistent { color: var(--green); }
+    .retention-editor { position: absolute; z-index: 10; top: calc(100% + 6px); right: 0; display: flex; align-items: center; gap: 6px; padding: 8px; background: #1d2924; border: 1px solid #4c8061; border-radius: 8px; box-shadow: 0 10px 24px rgba(0, 0, 0, .35); white-space: nowrap; }
+    .retention-editor input { width: 82px; }
     .file-row td { padding: 6px 10px 10px 52px; color: var(--muted); background: #121817; }
     .file-list { display: grid; gap: 4px; }
     .file-item { display: flex; gap: 10px; align-items: baseline; }
@@ -263,7 +266,44 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     function tagsNode(tags) { const list = document.createElement("div"); list.className = "tag-list"; const entries = Object.entries(tags || {}); if (!entries.length) { const empty = document.createElement("span"); empty.className = "muted"; empty.textContent = "No tags"; list.append(empty); } for (const [key, value] of entries) { const tag = document.createElement("span"); tag.className = "tag"; tag.textContent = key + "=" + value; list.append(tag); } return list; }
     function button(label, className, onClick) { const item = document.createElement("button"); item.type = "button"; item.className = "button small " + (className || ""); item.textContent = label; item.onclick = onClick; return item; }
     function cell(value = "—") { const item = document.createElement("td"); item.textContent = value; return item; }
-    async function renderFiles(detailRow, packageName, versionName) { try { const data = await api("/api/admin/packages/" + encodeURIComponent(packageName) + "/versions/" + encodeURIComponent(versionName)); const td = detailRow.firstElementChild; td.replaceChildren(); const list = document.createElement("div"); list.className = "file-list"; for (const file of data.files || []) { const item = document.createElement("div"); item.className = "file-item"; const kind = document.createElement("span"); kind.className = "file-kind"; kind.textContent = file.kind; const key = document.createElement("span"); key.className = "file-key"; key.textContent = file.key + " · " + formatBytes(file.size) + " · " + (file.state || "missing"); item.append(kind, key); list.append(item); } if (!list.children.length) list.textContent = "No files"; td.append(list); detailRow.classList.toggle("hidden"); } catch (error) { setMessage(error.message, "error"); } }
+    async function toggleFiles(detailRow, packageName, versionName, toggle) {
+      const opening = toggle.textContent === "＋";
+      if (!opening) { detailRow.classList.add("hidden"); toggle.textContent = "＋"; return; }
+      const td = detailRow.firstElementChild;
+      detailRow.classList.remove("hidden");
+      if (detailRow.dataset.loaded === "true") { toggle.textContent = "−"; return; }
+      toggle.disabled = true;
+      toggle.textContent = "…";
+      td.textContent = "Loading files…";
+      try {
+        const data = await api("/api/admin/packages/" + encodeURIComponent(packageName) + "/versions/" + encodeURIComponent(versionName));
+        td.replaceChildren();
+        const list = document.createElement("div");
+        list.className = "file-list";
+        for (const file of data.files || []) {
+          const item = document.createElement("div");
+          item.className = "file-item";
+          const kind = document.createElement("span");
+          kind.className = "file-kind";
+          kind.textContent = file.kind;
+          const key = document.createElement("span");
+          key.className = "file-key";
+          key.textContent = file.key + " · " + formatBytes(file.size) + " · " + (file.state || "missing");
+          item.append(kind, key);
+          list.append(item);
+        }
+        if (!list.children.length) list.textContent = "No files";
+        td.append(list);
+        detailRow.dataset.loaded = "true";
+        toggle.textContent = "−";
+      } catch (error) {
+        detailRow.classList.add("hidden");
+        toggle.textContent = "＋";
+        setMessage(error.message, "error");
+      } finally {
+        toggle.disabled = false;
+      }
+    }
     function sortedTagEntries(tags) { return Object.entries(tags || {}).sort(([left], [right]) => left.localeCompare(right)); }
     function tagGroupKey(tags) { return JSON.stringify(sortedTagEntries(tags)); }
     function tagGroupLabel(tags) {
@@ -291,11 +331,13 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
         const packageCell = document.createElement("td");
         const expand = button("＋", "", () => {
           const opening = expand.textContent === "＋";
-          for (const child of body.querySelectorAll("." + packageClass)) {
-            if (!groupByTags || child.classList.contains("tag-group-row")) {
-              child.classList.toggle("hidden", !opening);
-            } else {
-              child.classList.add("hidden");
+          if (!opening) {
+            for (const child of body.querySelectorAll("." + packageClass)) child.classList.add("hidden");
+            for (const toggle of body.querySelectorAll("." + packageClass + " .group-toggle, ." + packageClass + " .version-toggle")) toggle.textContent = "＋";
+          } else {
+            for (const child of body.querySelectorAll("." + packageClass)) {
+              const visible = (!groupByTags && child.classList.contains("version-row")) || (groupByTags && child.classList.contains("tag-group-row"));
+              child.classList.toggle("hidden", !visible);
             }
           }
           expand.textContent = opening ? "−" : "＋";
@@ -314,9 +356,12 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
           const versionRow = document.createElement("tr");
           versionRow.className = "version-row " + childClasses.join(" ") + " hidden";
           const nameCell = document.createElement("td");
+          let detailRow;
+          const versionToggle = button("＋", "version-toggle", () => toggleFiles(detailRow, packageItem.packageName, version.versionName, versionToggle));
+          nameCell.append(versionToggle);
           const versionName = document.createElement("span");
           versionName.className = "version-name";
-          versionName.textContent = version.versionName;
+          versionName.textContent = " " + version.versionName;
           nameCell.append(versionName);
           const tags = document.createElement("td");
           tags.append(tagsNode(version.tags));
@@ -346,23 +391,32 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
           versionRow.append(retention);
           const actions = document.createElement("td");
           actions.className = "actions";
-          let detailRow;
-          actions.append(button("Files", "", () => renderFiles(detailRow, packageItem.packageName, version.versionName)));
-          const retentionInput = document.createElement("input");
-          retentionInput.type = "number";
-          retentionInput.min = "0";
-          retentionInput.value = version.retentionDays == null ? "" : String(version.retentionDays);
-          retentionInput.style.width = "80px";
-          actions.append(retentionInput);
-          actions.append(button("Save", "primary", async () => {
-            try {
-              await api("/api/admin/packages/" + encodeURIComponent(packageItem.packageName) + "/versions/" + encodeURIComponent(version.versionName), { method: "PATCH", body: JSON.stringify({ retentionDays: optionalNumber(retentionInput.value) }) });
-              setMessage("Updated " + packageItem.packageName + " / " + version.versionName, "success");
-              await load();
-            } catch (error) {
-              setMessage(error.message, "error");
-            }
-          }));
+          const extendButton = button("Extend", "", () => {
+            const editor = document.createElement("span");
+            editor.className = "retention-editor";
+            const retentionInput = document.createElement("input");
+            retentionInput.type = "number";
+            retentionInput.min = "0";
+            retentionInput.placeholder = "days";
+            retentionInput.value = version.retentionDays == null ? "" : String(version.retentionDays);
+            const restore = () => actions.replaceChild(extendButton, editor);
+            const confirm = button("Confirm", "primary", async () => {
+              confirm.disabled = true;
+              try {
+                await api("/api/admin/packages/" + encodeURIComponent(packageItem.packageName) + "/versions/" + encodeURIComponent(version.versionName), { method: "PATCH", body: JSON.stringify({ retentionDays: optionalNumber(retentionInput.value) }) });
+                setMessage("Updated " + packageItem.packageName + " / " + version.versionName, "success");
+                await load();
+              } catch (error) {
+                confirm.disabled = false;
+                setMessage(error.message, "error");
+              }
+            });
+            const cancel = button("Cancel", "", restore);
+            editor.append(retentionInput, confirm, cancel);
+            actions.replaceChild(editor, extendButton);
+            retentionInput.focus();
+          });
+          actions.append(extendButton);
           actions.append(button(version.pinned ? "Unpin" : "Pin", "", async () => {
             try {
               await api("/api/admin/packages/" + encodeURIComponent(packageItem.packageName) + "/versions/" + encodeURIComponent(version.versionName) + "/pin", { method: version.pinned ? "DELETE" : "PUT" });
@@ -390,7 +444,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
           detailRow.className = "file-row " + childClasses.join(" ") + " hidden";
           const detailCell = document.createElement("td");
           detailCell.colSpan = 7;
-          detailCell.textContent = "Click Files to inspect this version's cache files.";
+          detailCell.textContent = "Loading files…";
           detailRow.append(detailCell);
           body.append(detailRow);
         };
@@ -409,9 +463,13 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
             const groupRow = document.createElement("tr");
             groupRow.className = "tag-group-row " + packageClass + " hidden";
             const groupCell = document.createElement("td");
-            const groupExpand = button("＋", "", () => {
+            const groupExpand = button("＋", "group-toggle", () => {
               const opening = groupExpand.textContent === "＋";
-              for (const child of body.querySelectorAll("." + groupClass)) child.classList.toggle("hidden", !opening);
+              for (const child of body.querySelectorAll("." + groupClass)) {
+                if (opening && child.classList.contains("version-row")) child.classList.remove("hidden");
+                else if (!opening) child.classList.add("hidden");
+              }
+              if (!opening) for (const toggle of body.querySelectorAll("." + groupClass + " .version-toggle")) toggle.textContent = "＋";
               groupExpand.textContent = opening ? "−" : "＋";
             });
             groupCell.append(groupExpand);
