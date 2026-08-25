@@ -98,6 +98,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     .muted { color: var(--muted); }
     .retention { color: var(--amber); }
     .expired { color: var(--red); }
+    .gc-eligible { color: var(--red); font-weight: 700; }
     .persistent { color: var(--green); }
     .file-row td { padding: 6px 10px 10px 52px; color: var(--muted); background: #121817; }
     .file-list { display: grid; gap: 4px; }
@@ -321,7 +322,11 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
           tags.append(tagsNode(version.tags));
           versionRow.append(nameCell, tags, cell(String(version.fileCount)), cell(formatBytes(version.bytes)), cell(formatDate(version.registeredAt)));
           const retention = document.createElement("td");
-          retention.className = version.retentionState === "persistent" ? "persistent" : "retention";
+          const capacityExceeded = version.capacityExceeded === true;
+          const durationExpired = version.retentionRemainingSeconds !== null
+            && version.retentionRemainingSeconds !== undefined
+            && Number(version.retentionRemainingSeconds) < 0;
+          retention.className = version.retentionState === "persistent" ? "persistent" : (capacityExceeded || durationExpired ? "gc-eligible" : "retention");
           retention.textContent = version.retentionState;
           if (version.retentionRemainingSeconds !== null && version.retentionRemainingSeconds !== undefined) {
             const remainingSeconds = Number(version.retentionRemainingSeconds);
@@ -331,6 +336,12 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
             retention.append(document.createElement("br"), remaining);
           } else if (version.retentionRemainingDays !== null && version.retentionRemainingDays !== undefined) {
             retention.append(document.createElement("br"), document.createTextNode(formatDaysLeft(version.retentionRemainingDays)));
+          }
+          if (capacityExceeded) {
+            const capacityNotice = document.createElement("span");
+            capacityNotice.className = "gc-eligible";
+            capacityNotice.textContent = "GC eligible · capacity exceeded";
+            retention.append(document.createElement("br"), capacityNotice);
           }
           versionRow.append(retention);
           const actions = document.createElement("td");

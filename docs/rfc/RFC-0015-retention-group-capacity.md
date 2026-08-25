@@ -82,8 +82,10 @@ rows remain unlimited and existing jobs remain valid. No Nix HTTP or object
 schema change is required.
 
 The admin API adds `capacityVersions` to policy GET/POST/PUT payloads while
-retaining all existing fields. The admin console exposes the new action and
-describes its early-cleanup behavior.
+retaining all existing fields. Version summaries also expose whether an active
+unprotected version is beyond a matching capacity; the admin console marks
+those automatic-GC candidates in red and explains that capacity caused the
+early cleanup eligibility.
 
 ## Acceptance tests
 
@@ -95,6 +97,7 @@ describes its early-cleanup behavior.
 - Overlapping capacity rules and unioned keep-latest protection.
 - Pinned versions remaining untouched even when over capacity.
 - Capacity ranking and cleanup across multiple GC pages and resumed jobs.
+- Admin retention display marking capacity-triggered GC candidates in red.
 - Existing cache TTL, Nix HTTP, and shared-NAR deletion protections remaining
   unchanged.
 

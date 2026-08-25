@@ -117,6 +117,7 @@ async function versionSummary(
   env: AppEnv["Bindings"],
   row: VersionRow,
   protectedIds: Set<string>,
+  capacityExceededIds: Set<string>,
   policies: PolicyRow[],
   fallback: number,
   includeFiles = false,
@@ -126,12 +127,14 @@ async function versionSummary(
   const protectedByKeepLatest = protectedIds.has(row.version_id);
   const retentionDays = effectiveRetentionDays(row, policies, fallback);
   const isPersistent = row.pinned || protectedByKeepLatest;
+  const capacityExceeded = !isPersistent && capacityExceededIds.has(row.version_id);
   const result: Record<string, unknown> = {
     ...serializeVersion(row),
     fileCount: files.length,
     bytes,
     effectiveRetentionDays: retentionDays,
     protectedByKeepLatest,
+    capacityExceeded,
     retentionState: isPersistent ? "persistent" : `${retentionDays} days`,
     retentionRemainingDays: isPersistent ? null : remainingRetentionDays(row, retentionDays),
     retentionRemainingSeconds: isPersistent ? null : remainingRetentionSeconds(row, retentionDays),
@@ -187,6 +190,67 @@ async function protectedVersionIdsForRows(env: AppEnv["Bindings"], rows: Version
   return protectedIds;
 }
 
+async function capacityExceededVersionIdsForRows(env: AppEnv["Bindings"], rows: VersionRow[], policies: PolicyRow[]): Promise<Set<string>> {
+  const targets = new Map<string, number>();
+  for (const row of rows) {
+    if (row.state !== "active") continue;
+    for (const policy of matchingPolicies(row, policies)) {
+      const fields = policyGroupBy(policy);
+      if (policy.capacity_versions == null || !fields) continue;
+      targets.set(`${policy.id}:${groupKey(row, fields)}`, policy.capacity_versions);
+    }
+  }
+  if (!targets.size) return new Set();
+
+  const newest = new Map<string, Array<{ versionId: string; registeredAt: string }>>();
+  let lastVersionId = "";
+  while (true) {
+    const page = await env.DB.prepare(
+      `SELECT * FROM artifact_versions WHERE state = 'active' AND version_id > ? ORDER BY version_id LIMIT 200`,
+    ).bind(lastVersionId).all<VersionRow>();
+    for (const candidate of page.results) {
+      for (const policy of matchingPolicies(candidate, policies)) {
+        const fields = policyGroupBy(policy);
+        if (!fields || policy.capacity_versions == null) continue;
+        const targetKey = `${policy.id}:${groupKey(candidate, fields)}`;
+        const capacity = targets.get(targetKey);
+        if (capacity === undefined || capacity <= 0) continue;
+        const list = newest.get(targetKey) ?? [];
+        const item = { versionId: candidate.version_id, registeredAt: candidate.registered_at };
+        if (list.length < capacity) {
+          list.push(item);
+          if (list.length === capacity) list.sort(compareRegisteredVersions);
+        } else {
+          const worst = list[list.length - 1];
+          if (worst && compareRegisteredVersions(item, worst) < 0) {
+            list[list.length - 1] = item;
+            list.sort(compareRegisteredVersions);
+          }
+        }
+        newest.set(targetKey, list);
+      }
+    }
+    if (page.results.length < 200) break;
+    lastVersionId = page.results[page.results.length - 1].version_id;
+  }
+
+  const keptIds = new Set<string>();
+  for (const list of newest.values()) for (const item of list) keptIds.add(item.versionId);
+  const exceededIds = new Set<string>();
+  for (const row of rows) {
+    if (row.state !== "active" || keptIds.has(row.version_id)) continue;
+    for (const policy of matchingPolicies(row, policies)) {
+      const fields = policyGroupBy(policy);
+      if (policy.capacity_versions == null || !fields) continue;
+      if (targets.has(`${policy.id}:${groupKey(row, fields)}`)) {
+        exceededIds.add(row.version_id);
+        break;
+      }
+    }
+  }
+  return exceededIds;
+}
+
 function packageItems(versions: VersionRow[], query: string): Map<string, VersionRow[]> {
   const groups = new Map<string, VersionRow[]>();
   for (const row of versions) {
@@ -211,9 +275,11 @@ async function packageResponse(
   policies: PolicyRow[],
   fallback: number,
   protectedIds?: Set<string>,
+  capacityExceededIds?: Set<string>,
 ): Promise<Record<string, unknown>> {
   const effectiveProtectedIds = protectedIds ?? await protectedVersionIdsForRows(env, rows, policies);
-  const versions = await Promise.all(rows.map((row) => versionSummary(env, row, effectiveProtectedIds, policies, fallback)));
+  const effectiveCapacityExceededIds = capacityExceededIds ?? await capacityExceededVersionIdsForRows(env, rows, policies);
+  const versions = await Promise.all(rows.map((row) => versionSummary(env, row, effectiveProtectedIds, effectiveCapacityExceededIds, policies, fallback)));
   return {
     packageName,
     versionCount: versions.length,
@@ -277,8 +343,9 @@ adminRoutes.get("/api/admin/packages", async (c) => {
   const versions = await loadVersionsForPackages(c.env, selectedNames);
   const groups = packageItems(versions, query);
   const protectedIds = await protectedVersionIdsForRows(c.env, versions, policies);
+  const capacityExceededIds = await capacityExceededVersionIdsForRows(c.env, versions, policies);
   return c.json({
-    items: await Promise.all(selectedNames.map((packageName) => packageResponse(c.env, packageName, groups.get(packageName) ?? [], policies, fallback, protectedIds))),
+    items: await Promise.all(selectedNames.map((packageName) => packageResponse(c.env, packageName, groups.get(packageName) ?? [], policies, fallback, protectedIds, capacityExceededIds))),
     total,
     offset,
     limit,
@@ -292,7 +359,8 @@ adminRoutes.get("/api/admin/packages/:packageName/versions/:versionName", async 
   if (!row || row.state === "deleted") throw new AppError("not_found", "The version was not found", 404);
   const [policies, fallback] = await Promise.all([loadPolicies(c.env), fallbackRetention(c.env)]);
   const protectedIds = await protectedVersionIdsForRows(c.env, [row], policies);
-  return c.json(await versionSummary(c.env, row, protectedIds, policies, fallback, true));
+  const capacityExceededIds = await capacityExceededVersionIdsForRows(c.env, [row], policies);
+  return c.json(await versionSummary(c.env, row, protectedIds, capacityExceededIds, policies, fallback, true));
 });
 
 adminRoutes.get("/api/admin/packages/:packageName", async (c) => {
@@ -300,7 +368,8 @@ adminRoutes.get("/api/admin/packages/:packageName", async (c) => {
   const [rows, policies, fallback] = await Promise.all([loadVersionsForPackage(c.env, packageName), loadPolicies(c.env), fallbackRetention(c.env)]);
   if (!rows.length) throw new AppError("not_found", "The package was not found", 404);
   const protectedIds = await protectedVersionIdsForRows(c.env, rows, policies);
-  return c.json(await packageResponse(c.env, packageName, rows, policies, fallback, protectedIds));
+  const capacityExceededIds = await capacityExceededVersionIdsForRows(c.env, rows, policies);
+  return c.json(await packageResponse(c.env, packageName, rows, policies, fallback, protectedIds, capacityExceededIds));
 });
 
 adminRoutes.patch("/api/admin/packages/:packageName/versions/:versionName", async (c) => {
@@ -325,7 +394,8 @@ adminRoutes.patch("/api/admin/packages/:packageName/versions/:versionName", asyn
   if (!updated) throw new AppError("not_found", "The version was not found", 404);
   const [policies, fallback] = await Promise.all([loadPolicies(c.env), fallbackRetention(c.env)]);
   const protectedIds = await protectedVersionIdsForRows(c.env, [updated], policies);
-  return c.json(await versionSummary(c.env, updated, protectedIds, policies, fallback));
+  const capacityExceededIds = await capacityExceededVersionIdsForRows(c.env, [updated], policies);
+  return c.json(await versionSummary(c.env, updated, protectedIds, capacityExceededIds, policies, fallback));
 });
 
 async function setPin(c: Context<AppEnv>, pinned: boolean): Promise<Response> {

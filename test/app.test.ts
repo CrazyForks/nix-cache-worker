@@ -128,6 +128,9 @@ describe("Admin console page", () => {
     expect(html).toContain("const formatRetentionRemaining = (value)");
     expect(html).toContain('return "Expired"');
     expect(html).toContain('className = remainingSeconds < 0 ? "expired" : ""');
+    expect(html).toContain("capacityExceeded");
+    expect(html).toContain("GC eligible · capacity exceeded");
+    expect(html).toContain(".gc-eligible { color: var(--red)");
     expect(html).toContain("waitForJob(jobId)");
     expect(html).toContain('result.reused ? "GC already scheduled · " : "GC started · "');
     expect(html).toContain('setMessage("GC scan completed · queued deletions may continue", "success")');
@@ -419,6 +422,31 @@ describe("Nix cache HTTP API", () => {
     expect(aging?.retentionRemainingSeconds).toBeLessThan(129700);
     expect(protectedVersion).toMatchObject({ protectedByKeepLatest: true, retentionState: "persistent", retentionRemainingDays: null });
     expect(expired?.retentionRemainingSeconds).toBeLessThan(0);
+  });
+
+  it("marks unprotected capacity-overage versions as GC eligible in retention summaries", async () => {
+    const packageName = "retention-capacity-display-package";
+    const now = Date.now();
+    for (let index = 0; index < 5; index += 1) {
+      const registeredAt = new Date(now - (5 - index) * 1000).toISOString();
+      await testEnv.DB.prepare(
+        "INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, retention_days, registered_at, updated_at, state) VALUES (?, ?, ?, '{}', 30, ?, ?, 'active')",
+      ).bind(`${packageName}-v${index}`, packageName, `v${index}`, registeredAt, registeredAt).run();
+    }
+    const policy = await request("/api/admin/policies", {
+      method: "POST",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "capacity-display-rule", conditions: [{ field: "pkg_name", operator: "equals", value: packageName, negate: false }], groupBy: ["pkg_name"], lastN: null, durationDays: null, capacityVersions: 2 }),
+    });
+    expect(policy.response.status).toBe(201);
+
+    const response = await request(`/api/admin/packages/${packageName}`, { headers: bearer("admin-secret") });
+    expect(response.response.status).toBe(200);
+    const body = await response.response.json<{ versions: Array<{ versionName: string; capacityExceeded: boolean; protectedByKeepLatest: boolean }> }>();
+    expect(body.versions.find((version) => version.versionName === "v0")).toMatchObject({ capacityExceeded: true, protectedByKeepLatest: false });
+    expect(body.versions.find((version) => version.versionName === "v1")).toMatchObject({ capacityExceeded: true, protectedByKeepLatest: false });
+    expect(body.versions.find((version) => version.versionName === "v2")).toMatchObject({ capacityExceeded: false, protectedByKeepLatest: true });
+    expect(body.versions.find((version) => version.versionName === "v4")).toMatchObject({ capacityExceeded: false, protectedByKeepLatest: true });
   });
 
   it("exposes package, version, and file hierarchy and targets version operations", async () => {
