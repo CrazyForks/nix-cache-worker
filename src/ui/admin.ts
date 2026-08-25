@@ -85,11 +85,12 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; min-width: 920px; }
     th { color: var(--muted); font-size: 11px; text-align: left; text-transform: uppercase; letter-spacing: .08em; padding: 10px; border-bottom: 1px solid var(--line); }
-    td { padding: 12px 10px; border-bottom: 1px solid #28302e; vertical-align: top; }
-    .package-row { background: #1b2321; }
-    .package-row td { border-bottom-color: #3c5048; font-weight: 700; }
+    td { padding: 12px 10px; border-bottom: 0; vertical-align: top; }
+    tbody tr { border-bottom: 1px solid #28302e; }
+    .package-row { background: #1b2321; border-bottom-color: #3c5048; }
+    .package-row td { font-weight: 700; }
     .package-name { color: var(--green); font-size: 15px; }
-    .tag-group-row { background: #202b27; }
+    .tag-group-row { background: #202b27; border-bottom-color: #3c5048; }
     .tag-group-row td:first-child { padding-left: 24px; }
     .tag-group-name { color: var(--green); font-weight: 700; }
     .version-row td:first-child { padding-left: 30px; }

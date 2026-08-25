@@ -137,6 +137,8 @@ describe("Admin console page", () => {
     expect(html).not.toContain("Click Files to inspect this version's cache files.");
     expect(html).toContain("Extend");
     expect(html).toContain("retention-editor");
+    expect(html).toContain("tbody tr { border-bottom: 1px solid #28302e; }");
+    expect(html).toContain("td { padding: 12px 10px; border-bottom: 0;");
     expect(html).toContain("waitForJob(jobId)");
     expect(html).toContain('result.reused ? "GC already scheduled · " : "GC started · "');
     expect(html).toContain('setMessage("GC scan completed · queued deletions may continue", "success")');
