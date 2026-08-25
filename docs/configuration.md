@@ -107,7 +107,9 @@ The baseline migration seeds an editable rule that protects the newest three
 versions for each exact package name and complete tag combination. The default
 finite retention is seven days. Administrators can change the default, create
 structured rules, pin versions, run GC, and request confirmed deletion from
-the console.
+the console. A structured rule may also set `capacityVersions` to limit the
+number of active versions tolerated by each computed group; omitted or `null`
+means unlimited.
 
 Pins protect versions from automatic GC only. Explicit deletion of a pinned
 version requires confirmation and is recorded in the audit log. Persistent GC

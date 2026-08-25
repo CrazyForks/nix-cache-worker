@@ -28,6 +28,7 @@ beforeAll(async () => {
     DROP TABLE IF EXISTS settings;
     DROP TABLE IF EXISTS jobs;
     DROP TABLE IF EXISTS gc_policy_matches;
+    DROP TABLE IF EXISTS gc_policy_capacity_matches;
     DROP TABLE IF EXISTS gc_scan_versions;
     DROP TABLE IF EXISTS delete_job_nars;
     DROP TABLE IF EXISTS delete_job_narinfos;
@@ -39,7 +40,7 @@ beforeAll(async () => {
     CREATE TABLE narinfo_refs (narinfo_key TEXT PRIMARY KEY, nar_key TEXT NOT NULL, store_path TEXT, created_at TEXT NOT NULL);
     CREATE TABLE artifact_versions (version_id TEXT PRIMARY KEY, package_name TEXT NOT NULL, version_name TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '{}', retention_days INTEGER, pinned INTEGER NOT NULL DEFAULT 0, registered_at TEXT NOT NULL, updated_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', UNIQUE(package_name, version_name));
     CREATE TABLE artifact_version_members (version_id TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(version_id, narinfo_key));
-    CREATE TABLE gc_policies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, conditions_json TEXT NOT NULL DEFAULT '[]', group_by_json TEXT NOT NULL DEFAULT '[]', last_n INTEGER, duration_days INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE gc_policies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, conditions_json TEXT NOT NULL DEFAULT '[]', group_by_json TEXT NOT NULL DEFAULT '[]', last_n INTEGER, duration_days INTEGER, capacity_versions INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE jobs (id TEXT PRIMARY KEY, type TEXT NOT NULL, status TEXT NOT NULL, target_version_id TEXT, cursor INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL DEFAULT '{}', last_error TEXT, created_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE write_claims (r2_key TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at TEXT NOT NULL);
@@ -47,13 +48,14 @@ beforeAll(async () => {
     CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, actor TEXT NOT NULL, target TEXT, details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
     CREATE TABLE gc_scan_versions (job_id TEXT NOT NULL, version_id TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(job_id, version_id));
     CREATE TABLE gc_policy_matches (job_id TEXT NOT NULL, version_id TEXT NOT NULL, policy_id INTEGER NOT NULL, group_key TEXT NOT NULL, registered_at TEXT NOT NULL, keep_count INTEGER NOT NULL, PRIMARY KEY(job_id, version_id, policy_id));
+    CREATE TABLE gc_policy_capacity_matches (job_id TEXT NOT NULL, version_id TEXT NOT NULL, policy_id INTEGER NOT NULL, group_key TEXT NOT NULL, registered_at TEXT NOT NULL, capacity_versions INTEGER NOT NULL, PRIMARY KEY(job_id, version_id, policy_id));
     CREATE TABLE delete_job_nars (job_id TEXT NOT NULL, nar_key TEXT NOT NULL, PRIMARY KEY(job_id, nar_key));
     CREATE TABLE delete_job_narinfos (job_id TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(job_id, narinfo_key));
     CREATE UNIQUE INDEX idx_jobs_active_delete_target ON jobs(target_version_id) WHERE type = 'delete_version' AND target_version_id IS NOT NULL AND status IN ('queued', 'running', 'failed');
   `);
   await testEnv.DB.prepare(
-    "INSERT INTO gc_policies (name, conditions_json, group_by_json, last_n, duration_days, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-  ).bind("default-package-tags", "[]", '["pkg_name","pkg_tags"]', 3, null, "2026-08-01T00:00:00.000Z", "2026-08-01T00:00:00.000Z").run();
+    "INSERT INTO gc_policies (name, conditions_json, group_by_json, last_n, duration_days, capacity_versions, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  ).bind("default-package-tags", "[]", '["pkg_name","pkg_tags"]', 3, null, null, "2026-08-01T00:00:00.000Z", "2026-08-01T00:00:00.000Z").run();
 });
 
 async function request(path: string, init: RequestInit = {}): Promise<{ response: Response; waitUntil: Promise<unknown>[] }> {
@@ -111,6 +113,9 @@ describe("Admin console page", () => {
     expect(html).toContain('aria-pressed="true"');
     expect(html).toContain("let groupByTags = true");
     expect(html).toContain("function tagGroupLabel(tags)");
+    expect(html).toContain('id="enableCapacity"');
+    expect(html).toContain("capacityVersions");
+    expect(html).toContain("Over-capacity versions may be removed before the duration expires.");
     expect(html).toContain('hourCycle: "h23"');
     expect(html).toContain("const formatRetentionRemaining = (value)");
     expect(html).toContain('return "Expired"');
@@ -162,6 +167,7 @@ describe("Structured retention rule API", () => {
       groupBy: ["pkg_name", "pkg_tag:system"],
       lastN: 2,
       durationDays: 30,
+      capacityVersions: 20,
     };
     const created = await request("/api/admin/policies", { method: "POST", headers: { ...bearer("admin-secret"), "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     expect(created.response.status).toBe(201);
@@ -170,6 +176,15 @@ describe("Structured retention rule API", () => {
     expect(createdBody.groupBy).toEqual(payload.groupBy);
     expect(createdBody.lastN).toBe(2);
     expect(createdBody.durationDays).toBe(30);
+    expect(createdBody.capacityVersions).toBe(20);
+
+    const updated = await request(`/api/admin/policies/${createdBody.id}`, {
+      method: "PUT",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ ...payload, capacityVersions: 21 }),
+    });
+    expect(updated.response.status).toBe(200);
+    expect((await updated.response.json<{ capacityVersions: number }>()).capacityVersions).toBe(21);
 
     const highCount = await request("/api/admin/policies", {
       method: "POST",
@@ -180,9 +195,24 @@ describe("Structured retention rule API", () => {
     const tooMany = await request("/api/admin/policies", {
       method: "POST",
       headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "api-too-many-rule", conditions: [], groupBy: [], lastN: 100_001, durationDays: null }),
+      body: JSON.stringify({ name: "api-too-many-rule", conditions: [], groupBy: [], lastN: null, durationDays: null, capacityVersions: 100_001 }),
     });
     expect(tooMany.response.status).toBe(422);
+
+    const capacityOnly = await request("/api/admin/policies", {
+      method: "POST",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "api-capacity-only-rule", conditions: [{ field: "pkg_name", operator: "equals", value: "capacity-only-package", negate: false }], groupBy: ["pkg_name"], lastN: null, durationDays: null, capacityVersions: 4 }),
+    });
+    expect(capacityOnly.response.status).toBe(201);
+    expect((await capacityOnly.response.json<{ capacityVersions: number }>()).capacityVersions).toBe(4);
+
+    const zeroCapacity = await request("/api/admin/policies", {
+      method: "POST",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "api-zero-capacity-rule", conditions: [{ field: "pkg_name", operator: "equals", value: "zero-capacity-package", negate: false }], groupBy: [], lastN: null, durationDays: null, capacityVersions: 0 }),
+    });
+    expect(zeroCapacity.response.status).toBe(201);
 
     const listed = await request("/api/admin/policies", { headers: bearer("admin-secret") });
     expect(listed.response.status).toBe(200);
@@ -568,5 +598,71 @@ describe("Nix cache HTTP API", () => {
     expect((await request("/api/admin/packages/gc-package/versions/old", { headers: bearer("admin-secret") })).response.status).toBe(404);
     expect((await request("/api/admin/packages/gc-package/versions/middle", { headers: bearer("admin-secret") })).response.status).toBe(200);
     expect((await request("/api/admin/packages/gc-package/versions/new", { headers: bearer("admin-secret") })).response.status).toBe(200);
+  });
+
+  it("enforces capacity independently for each group without waiting for duration", async () => {
+    const packageName = "capacity-gc-package";
+    const timestamp = new Date().toISOString();
+    await testEnv.DB.prepare(
+      "INSERT INTO artifact_packages (package_name, created_at, updated_at) VALUES (?, ?, ?)",
+    ).bind(packageName, timestamp, timestamp).run();
+    const versions = [
+      ["a-old", "alpha"], ["a-middle", "alpha"], ["a-new", "alpha"], ["a-newest", "alpha"],
+      ["b-old", "beta"], ["b-middle", "beta"], ["b-new", "beta"], ["b-newest", "beta"],
+    ];
+    for (const [index, [versionName, channel]] of versions.entries()) {
+      const registeredAt = new Date(Date.now() - (versions.length - index) * 1000).toISOString();
+      await testEnv.DB.prepare(
+        "INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, registered_at, updated_at, state) VALUES (?, ?, ?, ?, ?, ?, 'active')",
+      ).bind(`${packageName}-${versionName}`, packageName, versionName, JSON.stringify({ channel }), registeredAt, registeredAt).run();
+    }
+    const policy = await request("/api/admin/policies", {
+      method: "POST",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "capacity-gc-rule", conditions: [{ field: "pkg_name", operator: "equals", value: packageName, negate: false }], groupBy: ["pkg_tag:channel"], lastN: null, durationDays: null, capacityVersions: 2 }),
+    });
+    expect(policy.response.status).toBe(201);
+
+    const gc = await request("/api/admin/gc", { method: "POST", headers: bearer("admin-secret") });
+    await Promise.all(gc.waitUntil);
+
+    expect((await request(`/api/admin/packages/${packageName}/versions/a-old`, { headers: bearer("admin-secret") })).response.status).toBe(404);
+    expect((await request(`/api/admin/packages/${packageName}/versions/b-old`, { headers: bearer("admin-secret") })).response.status).toBe(404);
+    for (const versionName of ["a-middle", "a-new", "a-newest", "b-middle", "b-new", "b-newest"]) {
+      expect((await request(`/api/admin/packages/${packageName}/versions/${versionName}`, { headers: bearer("admin-secret") })).response.status).toBe(200);
+    }
+  });
+
+  it("resumes capacity ranking across multiple GC pages", async () => {
+    const packageName = "capacity-page-package";
+    const timestamp = new Date().toISOString();
+    await testEnv.DB.prepare(
+      "INSERT INTO artifact_packages (package_name, created_at, updated_at) VALUES (?, ?, ?)",
+    ).bind(packageName, timestamp, timestamp).run();
+    const statements = Array.from({ length: 205 }, (_, index) => {
+      const versionName = `v${String(index).padStart(3, "0")}`;
+      const registeredAt = new Date(Date.now() - (205 - index) * 1000).toISOString();
+      return testEnv.DB.prepare(
+        "INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, registered_at, updated_at, state) VALUES (?, ?, ?, '{}', ?, ?, 'active')",
+      ).bind(`${packageName}-${versionName}`, packageName, versionName, registeredAt, registeredAt);
+    });
+    for (let offset = 0; offset < statements.length; offset += 100) await testEnv.DB.batch(statements.slice(offset, offset + 100));
+    const policy = await request("/api/admin/policies", {
+      method: "POST",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "capacity-page-rule", conditions: [{ field: "pkg_name", operator: "equals", value: packageName, negate: false }], groupBy: ["pkg_name"], lastN: null, durationDays: null, capacityVersions: 2 }),
+    });
+    expect(policy.response.status).toBe(201);
+
+    const scheduled = await scheduleGcJob(testEnv, "test", { reason: "capacity-page-test" });
+    await runQueuedJobs(testEnv, 4, 2);
+    expect((await testEnv.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(scheduled.id).first<{ status: string }>())?.status).toBe("queued");
+    await runQueuedJobs(testEnv, 10, 40);
+
+    expect((await request(`/api/admin/packages/${packageName}/versions/v000`, { headers: bearer("admin-secret") })).response.status).toBe(404);
+    expect((await request(`/api/admin/packages/${packageName}/versions/v001`, { headers: bearer("admin-secret") })).response.status).toBe(404);
+    for (const versionName of ["v202", "v203", "v204"]) {
+      expect((await request(`/api/admin/packages/${packageName}/versions/${versionName}`, { headers: bearer("admin-secret") })).response.status).toBe(200);
+    }
   });
 });

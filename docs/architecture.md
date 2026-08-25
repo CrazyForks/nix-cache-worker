@@ -54,6 +54,10 @@ package name, version name, all tags, or an individual tag value. Its `lastN`
 count protects the newest matching versions independently in each computed
 `groupBy` tuple. Overlapping rules union their protection, and the largest
 matching finite duration applies unless the version has an explicit override.
+An optional `capacityVersions` action is enforced independently for each
+matching policy/group; versions ranked beyond the limit may be deleted before
+their age-based retention expires. Pin and keep-latest protection remains
+fail-safe when protected versions exceed capacity.
 `registered_at` orders versions, not parsed version labels. GC and deletion use
 persistent jobs and bounded batches so a Worker interruption can be retried
 safely.

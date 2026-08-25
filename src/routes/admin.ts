@@ -405,6 +405,7 @@ type PolicyPayload = {
   groupBy: RetentionField[];
   lastN: number | null;
   durationDays: number | null;
+  capacityVersions: number | null;
 };
 
 const MAX_KEEP_LATEST_VERSIONS = 100_000;
@@ -441,8 +442,11 @@ function validatePolicyBody(body: Record<string, unknown>): PolicyPayload {
   };
   const lastN = parse(body.lastN, "lastN", MAX_KEEP_LATEST_VERSIONS, "versions");
   const durationDays = parse(body.durationDays, "durationDays", MAX_RETENTION_DAYS, "days");
-  if (lastN === null && durationDays === null) throw new AppError("invalid_policy", "Set lastN, durationDays, or both", 422);
-  return { name, conditions, groupBy, lastN, durationDays };
+  const capacityVersions = parse(body.capacityVersions, "capacityVersions", MAX_KEEP_LATEST_VERSIONS, "versions");
+  if (lastN === null && durationDays === null && capacityVersions === null) {
+    throw new AppError("invalid_policy", "Set lastN, durationDays, capacityVersions, or at least one action", 422);
+  }
+  return { name, conditions, groupBy, lastN, durationDays, capacityVersions };
 }
 
 function serializePolicy(row: PolicyRow): Record<string, unknown> {
@@ -455,6 +459,7 @@ function serializePolicy(row: PolicyRow): Record<string, unknown> {
     groupBy,
     lastN: row.last_n,
     durationDays: row.duration_days,
+    capacityVersions: row.capacity_versions,
   };
 }
 
@@ -468,8 +473,8 @@ adminRoutes.post("/api/admin/policies", async (c) => {
   const policy = validatePolicyBody(body);
   const timestamp = now();
   const result = await c.env.DB.prepare(
-    "INSERT INTO gc_policies (name, conditions_json, group_by_json, last_n, duration_days, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-  ).bind(policy.name, JSON.stringify(policy.conditions), JSON.stringify(policy.groupBy), policy.lastN, policy.durationDays, timestamp, timestamp).run();
+    "INSERT INTO gc_policies (name, conditions_json, group_by_json, last_n, duration_days, capacity_versions, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  ).bind(policy.name, JSON.stringify(policy.conditions), JSON.stringify(policy.groupBy), policy.lastN, policy.durationDays, policy.capacityVersions, timestamp, timestamp).run();
   await bumpCacheGeneration(c.env);
   await emitAudit(c.env, "policy_create", c.get("role"), policy.name);
   return c.json({ id: result.meta.last_row_id, ...policy }, 201);
@@ -481,8 +486,8 @@ adminRoutes.put("/api/admin/policies/:policyId", async (c) => {
   const body = await c.req.json<Record<string, unknown>>().catch(() => { throw new AppError("invalid_json", "The request body must be JSON", 400); });
   const policy = validatePolicyBody(body);
   const result = await c.env.DB.prepare(
-    "UPDATE gc_policies SET name = ?, conditions_json = ?, group_by_json = ?, last_n = ?, duration_days = ?, updated_at = ? WHERE id = ?",
-  ).bind(policy.name, JSON.stringify(policy.conditions), JSON.stringify(policy.groupBy), policy.lastN, policy.durationDays, now(), id).run();
+    "UPDATE gc_policies SET name = ?, conditions_json = ?, group_by_json = ?, last_n = ?, duration_days = ?, capacity_versions = ?, updated_at = ? WHERE id = ?",
+  ).bind(policy.name, JSON.stringify(policy.conditions), JSON.stringify(policy.groupBy), policy.lastN, policy.durationDays, policy.capacityVersions, now(), id).run();
   if (result.meta.changes === 0) throw new AppError("not_found", "The policy was not found", 404);
   await bumpCacheGeneration(c.env);
   await emitAudit(c.env, "policy_update", c.get("role"), String(id));

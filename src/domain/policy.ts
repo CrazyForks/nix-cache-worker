@@ -21,6 +21,7 @@ export type PolicyRow = {
   group_by_json: string;
   last_n: number | null;
   duration_days: number | null;
+  capacity_versions: number | null;
 };
 
 export function isRetentionField(value: string): value is RetentionField {

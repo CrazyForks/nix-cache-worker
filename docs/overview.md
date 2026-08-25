@@ -248,7 +248,8 @@ Policies use the following structured shape:
   ],
   "groupBy": ["pkg_name", "pkg_tag:system"],
   "lastN": 3,
-  "durationDays": 30
+  "durationDays": 30,
+  "capacityVersions": 20
 }
 ```
 
@@ -262,12 +263,18 @@ missing `pkg_tag:<tag>` has the empty-string value.
 an empty list means one global group. The newest `lastN` matching versions in
 each group are protected, ordered by `registered_at`, never by version-name
 parsing. `durationDays` applies to each matching version that is not otherwise
-protected. A rule may set either action or both.
+protected. `capacityVersions` is an optional hard upper bound for each group;
+the oldest unprotected versions beyond the bound may be removed before
+`durationDays` expires. A rule may set any one or combination of these actions.
+`null` means unlimited capacity and `0` allows no unprotected versions.
 
 When rules overlap, keep-latest protection is the union of all matching rules,
 and the finite duration is the largest matching `durationDays`. An explicit
-version `retentionDays` override still wins. Existing policy rows are cleared
-by the structured-rule migration and must be recreated in the new editor.
+version `retentionDays` override still wins for age-based retention. Capacity
+constraints from matching rules are all enforced, while pin and keep-latest
+protection remains effective even if it leaves a group above capacity. Existing
+policy rows are cleared by the structured-rule migration and must be recreated
+in the new editor.
 
 The default GC retention is 7 days. In addition to structured policies,
 the Worker protects the newest 3 versions for every exact package-name and

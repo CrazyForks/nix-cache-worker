@@ -23,7 +23,7 @@ function version(id: string, packageName: string, versionName: string, tags: Rec
   };
 }
 
-function policy(id: number, conditions: unknown[], groupBy: string[], lastN: number | null, durationDays: number | null): PolicyRow {
+function policy(id: number, conditions: unknown[], groupBy: string[], lastN: number | null, durationDays: number | null, capacityVersions: number | null = null): PolicyRow {
   return {
     id,
     name: `policy-${id}`,
@@ -31,6 +31,7 @@ function policy(id: number, conditions: unknown[], groupBy: string[], lastN: num
     group_by_json: JSON.stringify(groupBy),
     last_n: lastN,
     duration_days: durationDays,
+    capacity_versions: capacityVersions,
   };
 }
 

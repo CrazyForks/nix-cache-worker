@@ -14,6 +14,8 @@ import { createDeletionJob, findActiveDeletionJob, touchJob } from "./jobs";
 
 const BATCH_SIZE = 500;
 const GC_PAGE_SIZE = 200;
+// Keep the job ID plus version IDs below D1's per-statement variable budget.
+const GC_VERSION_QUERY_BATCH_SIZE = 50;
 const NAR_CLEANUP_BATCH_SIZE = 100;
 
 type MemberRow = { narinfo_key: string; nar_key: string | null };
@@ -62,11 +64,20 @@ async function recordGcPage(env: Bindings, jobId: string, versions: VersionRow[]
     ).bind(jobId, row.version_id, row.updated_at));
     for (const policy of matchingPolicies(row, policies)) {
       const fields = policyGroupBy(policy);
-      if ((policy.last_n ?? 0) <= 0 || !fields) continue;
-      statements.push(env.DB.prepare(
-        `INSERT OR REPLACE INTO gc_policy_matches
-         (job_id, version_id, policy_id, group_key, registered_at, keep_count) VALUES (?, ?, ?, ?, ?, ?)`,
-      ).bind(jobId, row.version_id, policy.id, groupKey(row, fields), row.registered_at, policy.last_n));
+      if (!fields) continue;
+      const key = groupKey(row, fields);
+      if ((policy.last_n ?? 0) > 0) {
+        statements.push(env.DB.prepare(
+          `INSERT OR REPLACE INTO gc_policy_matches
+           (job_id, version_id, policy_id, group_key, registered_at, keep_count) VALUES (?, ?, ?, ?, ?, ?)`,
+        ).bind(jobId, row.version_id, policy.id, key, row.registered_at, policy.last_n));
+      }
+      if (policy.capacity_versions != null) {
+        statements.push(env.DB.prepare(
+          `INSERT OR REPLACE INTO gc_policy_capacity_matches
+           (job_id, version_id, policy_id, group_key, registered_at, capacity_versions) VALUES (?, ?, ?, ?, ?, ?)`,
+        ).bind(jobId, row.version_id, policy.id, key, row.registered_at, policy.capacity_versions));
+      }
     }
   }
   for (let offset = 0; offset < statements.length; offset += 100) {
@@ -95,27 +106,63 @@ async function pruneGcMatches(env: Bindings, jobId: string): Promise<void> {
 
 async function protectedVersionIds(env: Bindings, jobId: string, versions: VersionRow[]): Promise<Set<string>> {
   if (!versions.length) return new Set();
-  const placeholders = versions.map(() => "?").join(",");
-  const result = await env.DB.prepare(
-    `SELECT DISTINCT version_id FROM gc_policy_matches
-     WHERE job_id = ? AND version_id IN (${placeholders})`,
-  ).bind(jobId, ...versions.map((row) => row.version_id)).all<{ version_id: string }>();
-  return new Set(result.results.map((row) => row.version_id));
+  const protectedIds = new Set<string>();
+  for (let offset = 0; offset < versions.length; offset += GC_VERSION_QUERY_BATCH_SIZE) {
+    const batch = versions.slice(offset, offset + GC_VERSION_QUERY_BATCH_SIZE);
+    const placeholders = batch.map(() => "?").join(",");
+    const result = await env.DB.prepare(
+      `SELECT DISTINCT version_id FROM gc_policy_matches
+       WHERE job_id = ? AND version_id IN (${placeholders})`,
+    ).bind(jobId, ...batch.map((row) => row.version_id)).all<{ version_id: string }>();
+    for (const row of result.results) protectedIds.add(row.version_id);
+  }
+  return protectedIds;
+}
+
+async function capacityExcessVersionIds(env: Bindings, jobId: string, versions: VersionRow[]): Promise<Set<string>> {
+  if (!versions.length) return new Set();
+  const capacityExcessIds = new Set<string>();
+  for (let offset = 0; offset < versions.length; offset += GC_VERSION_QUERY_BATCH_SIZE) {
+    const batch = versions.slice(offset, offset + GC_VERSION_QUERY_BATCH_SIZE);
+    const placeholders = batch.map(() => "?").join(",");
+    const result = await env.DB.prepare(
+      `SELECT version_id FROM (
+         SELECT version_id,
+                capacity_versions,
+                ROW_NUMBER() OVER (
+                  PARTITION BY policy_id, group_key
+                  ORDER BY registered_at DESC, version_id DESC
+                ) AS position
+         FROM gc_policy_capacity_matches
+         WHERE job_id = ?
+       ) ranked
+       WHERE position > capacity_versions
+         AND version_id IN (${placeholders})`,
+    ).bind(jobId, ...batch.map((row) => row.version_id)).all<{ version_id: string }>();
+    for (const row of result.results) capacityExcessIds.add(row.version_id);
+  }
+  return capacityExcessIds;
 }
 
 async function gcSnapshots(env: Bindings, jobId: string, versions: VersionRow[]): Promise<Map<string, string>> {
   if (!versions.length) return new Map();
-  const placeholders = versions.map(() => "?").join(",");
-  const result = await env.DB.prepare(
-    `SELECT version_id, updated_at FROM gc_scan_versions
-     WHERE job_id = ? AND version_id IN (${placeholders})`,
-  ).bind(jobId, ...versions.map((row) => row.version_id)).all<{ version_id: string; updated_at: string }>();
-  return new Map(result.results.map((row) => [row.version_id, row.updated_at]));
+  const snapshots = new Map<string, string>();
+  for (let offset = 0; offset < versions.length; offset += GC_VERSION_QUERY_BATCH_SIZE) {
+    const batch = versions.slice(offset, offset + GC_VERSION_QUERY_BATCH_SIZE);
+    const placeholders = batch.map(() => "?").join(",");
+    const result = await env.DB.prepare(
+      `SELECT version_id, updated_at FROM gc_scan_versions
+       WHERE job_id = ? AND version_id IN (${placeholders})`,
+    ).bind(jobId, ...batch.map((row) => row.version_id)).all<{ version_id: string; updated_at: string }>();
+    for (const row of result.results) snapshots.set(row.version_id, row.updated_at);
+  }
+  return snapshots;
 }
 
 async function completeGc(env: Bindings, jobId: string): Promise<void> {
   await env.DB.batch([
     env.DB.prepare("DELETE FROM gc_policy_matches WHERE job_id = ?").bind(jobId),
+    env.DB.prepare("DELETE FROM gc_policy_capacity_matches WHERE job_id = ?").bind(jobId),
     env.DB.prepare("DELETE FROM gc_scan_versions WHERE job_id = ?").bind(jobId),
     env.DB.prepare("UPDATE jobs SET status = 'completed', updated_at = ? WHERE id = ?").bind(now(), jobId),
   ]);
@@ -142,6 +189,7 @@ export async function processGc(env: Bindings, jobId: string): Promise<void> {
 
   const versions = await getGcPage(env, payload.lastVersionId ?? "");
   const protectedIds = await protectedVersionIds(env, jobId, versions);
+  const capacityExcessIds = await capacityExcessVersionIds(env, jobId, versions);
   const snapshots = await gcSnapshots(env, jobId, versions);
   const fallbackRetention = await defaultRetention(env);
   const timestamp = Date.now();
@@ -149,7 +197,8 @@ export async function processGc(env: Bindings, jobId: string): Promise<void> {
     const snapshotUpdatedAt = snapshots.get(row.version_id);
     if (!snapshotUpdatedAt || snapshotUpdatedAt !== row.updated_at || row.pinned || protectedIds.has(row.version_id)) continue;
     const retention = effectiveRetentionDays(row, policies, fallbackRetention);
-    if (timestamp - Date.parse(row.registered_at) < retention * 24 * 60 * 60 * 1000) continue;
+    const overCapacity = capacityExcessIds.has(row.version_id);
+    if (!overCapacity && timestamp - Date.parse(row.registered_at) < retention * 24 * 60 * 60 * 1000) continue;
     const existing = await findActiveDeletionJob(env, row.version_id);
     if (existing) {
       await env.DB.prepare("UPDATE artifact_versions SET state = 'deleting', updated_at = ? WHERE version_id = ? AND state = 'active'")

@@ -206,6 +206,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
             <div class="action-grid">
               <div class="action-card" id="lastNCard"><label class="action-toggle"><input id="enableLastN" type="checkbox"> Keep newest versions</label><div class="action-input"><input id="policy_last_n" type="number" min="0" placeholder="3" disabled><span class="unit">versions per group</span></div><p>Protected versions are never removed by automatic GC.</p></div>
               <div class="action-card" id="durationCard"><label class="action-toggle"><input id="enableDuration" type="checkbox"> Retain older versions for</label><div class="action-input"><input id="policy_duration" type="number" min="0" placeholder="30" disabled><span class="unit">days</span></div><p>Older unprotected versions become eligible after this age.</p></div>
+              <div class="action-card" id="capacityCard"><label class="action-toggle"><input id="enableCapacity" type="checkbox"> Allow up to</label><div class="action-input"><input id="policy_capacity" type="number" min="0" placeholder="20" disabled><span class="unit">versions per group</span></div><p>Over-capacity versions may be removed before the duration expires.</p></div>
             </div>
           </div>
           <div class="rule-preview" id="policyPreview">Configure an action to preview this rule.</div>
@@ -423,11 +424,11 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
       ["__tag__", "A specific tag value…"],
     ];
     const operatorOptions = [["equals", "equals"], ["starts_with", "starts with"], ["ends_with", "ends with"], ["contains", "contains"]];
-    let policyDraft = { conditions: [], groupBy: ["pkg_name"], lastN: null, durationDays: null };
+    let policyDraft = { conditions: [], groupBy: ["pkg_name"], lastN: null, durationDays: null, capacityVersions: null };
 
     function renderStats(overview) { $("statPackages").textContent = String(overview.packages || 0); $("statVersions").textContent = String(overview.versions || 0); $("statPinned").textContent = String(overview.pinnedVersions || 0); $("statObjects").textContent = String(overview.cacheObjects || 0); $("statBytes").textContent = formatBytes(overview.indexedBytes); }
     function normalizeCondition(condition) { return { field: condition.field || "pkg_name", operator: condition.operator || "equals", value: condition.value || "", negate: condition.negate === true }; }
-    function normalizePolicy(policy) { return { id: policy.id, name: policy.name, conditions: (policy.conditions || []).map(normalizeCondition), groupBy: [...(policy.groupBy || [])], lastN: policy.lastN ?? null, durationDays: policy.durationDays ?? null }; }
+    function normalizePolicy(policy) { return { id: policy.id, name: policy.name, conditions: (policy.conditions || []).map(normalizeCondition), groupBy: [...(policy.groupBy || [])], lastN: policy.lastN ?? null, durationDays: policy.durationDays ?? null, capacityVersions: policy.capacityVersions ?? null }; }
     function optionSelect(options, value, className) { const select = document.createElement("select"); if (className) select.className = className; for (const [optionValue, label] of options) { const option = document.createElement("option"); option.value = optionValue; option.textContent = label; option.selected = optionValue === value; select.append(option); } return select; }
     function fieldLabel(field) { if (field === "pkg_name") return "package name"; if (field === "pkg_version") return "package version"; if (field === "pkg_tags") return "all tags"; return "tag " + field.slice("pkg_tag:".length); }
     function operatorLabel(operator) { return ({ equals: "equals", starts_with: "starts with", ends_with: "ends with", contains: "contains" })[operator] || operator; }
@@ -505,15 +506,19 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
         groupBy,
         lastN: $("enableLastN").checked ? optionalNumber($("policy_last_n").value) : null,
         durationDays: $("enableDuration").checked ? optionalNumber($("policy_duration").value) : null,
+        capacityVersions: $("enableCapacity").checked ? optionalNumber($("policy_capacity").value) : null,
       };
     }
     function updateActionCards() {
       const lastNEnabled = $("enableLastN").checked;
       const durationEnabled = $("enableDuration").checked;
+      const capacityEnabled = $("enableCapacity").checked;
       $("policy_last_n").disabled = !lastNEnabled;
       $("policy_duration").disabled = !durationEnabled;
+      $("policy_capacity").disabled = !capacityEnabled;
       $("lastNCard").classList.toggle("disabled", !lastNEnabled);
       $("durationCard").classList.toggle("disabled", !durationEnabled);
+      $("capacityCard").classList.toggle("disabled", !capacityEnabled);
       renderRulePreview();
     }
     function renderRulePreview() {
@@ -523,6 +528,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
       const actions = [];
       if (draft.lastN !== null) actions.push("keep newest " + draft.lastN + " per group");
       if (draft.durationDays !== null) actions.push("retain others " + draft.durationDays + " days");
+      if (draft.capacityVersions !== null) actions.push("allow up to " + draft.capacityVersions + " versions per group");
       $("policyPreview").textContent = actions.length ? "WHEN " + where + " · GROUP BY " + group + " · " + actions.join(" · ") : "Configure an action to preview this rule.";
     }
     function fillActionInputs(draft) {
@@ -530,11 +536,13 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
       $("policy_last_n").value = draft.lastN === null ? "" : String(draft.lastN);
       $("enableDuration").checked = draft.durationDays !== null;
       $("policy_duration").value = draft.durationDays === null ? "" : String(draft.durationDays);
+      $("enableCapacity").checked = draft.capacityVersions !== null;
+      $("policy_capacity").value = draft.capacityVersions === null ? "" : String(draft.capacityVersions);
       updateActionCards();
     }
     function openPolicyEditor(policy = null) {
       editingPolicyId = policy?.id ?? null;
-      policyDraft = policy ? normalizePolicy(policy) : { conditions: [], groupBy: ["pkg_name"], lastN: null, durationDays: null };
+      policyDraft = policy ? normalizePolicy(policy) : { conditions: [], groupBy: ["pkg_name"], lastN: null, durationDays: null, capacityVersions: null };
       $("policy_name").value = policy?.name || "";
       $("policyEditorTitle").textContent = policy ? "Edit retention rule" : "Create retention rule";
       $("savePolicy").textContent = policy ? "Save rule" : "Create rule";
@@ -583,6 +591,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
         badges.className = "policy-badges";
         if (policy.lastN !== null) { const badge = document.createElement("span"); badge.className = "policy-badge action"; badge.textContent = "Keep newest " + policy.lastN; badges.append(badge); }
         if (policy.durationDays !== null) { const badge = document.createElement("span"); badge.className = "policy-badge action"; badge.textContent = "Retain " + policy.durationDays + " days"; badges.append(badge); }
+        if (policy.capacityVersions !== null) { const badge = document.createElement("span"); badge.className = "policy-badge action"; badge.textContent = "Capacity " + policy.capacityVersions + " / group"; badges.append(badge); }
         item.append(badges);
         list.append(item);
       }
@@ -602,8 +611,10 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     $("addGroupBy").onclick = () => { policyDraft = readPolicyDraft(); policyDraft.groupBy.push("pkg_name"); renderGroupByRows(); renderRulePreview(); };
     $("enableLastN").onchange = updateActionCards;
     $("enableDuration").onchange = updateActionCards;
+    $("enableCapacity").onchange = updateActionCards;
     $("policy_last_n").oninput = renderRulePreview;
     $("policy_duration").oninput = renderRulePreview;
+    $("policy_capacity").oninput = renderRulePreview;
     $("policy_name").oninput = renderRulePreview;
     function updateGroupToggle() { const control = $("groupTags"); control.classList.toggle("active", groupByTags); control.setAttribute("aria-pressed", String(groupByTags)); }
     $("groupTags").onclick = () => { groupByTags = !groupByTags; updateGroupToggle(); if (packagesData) renderPackages(packagesData); };
