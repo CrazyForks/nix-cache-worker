@@ -2,10 +2,13 @@
 
 ## Request path
 
-The Worker routes `/nix-cache-info`, narinfo paths, and `/nar/*` paths through
-Hono. Authentication is applied before mutation routes. Public GET and HEAD
-requests query R2 for object bytes and D1 for metadata-driven headers. PUT
-requests validate the path, enforce immutable semantics, and index the result.
+The Worker routes `/nix-cache-info`, narinfo paths, `/nar/*` paths, and the
+direct-upload control API through Hono. Authentication is applied before
+mutation routes. Public GET and HEAD requests query R2 for object bytes and D1
+for metadata-driven headers. Normal PUT requests validate the path, enforce
+immutable semantics, and index the result. Large direct uploads send the file
+to R2 outside the Worker and use the Worker only for verification and final
+indexing.
 
 ```text
 Nix client
@@ -17,15 +20,30 @@ Hono route + auth + request ID
 R2 object bytes              D1 object index
    |                              |
    +---- dynamic TTL / version membership
+
+Large CI NAR
+   |
+   +--> Worker creates session + presigned R2 URL
+   |
+   +--> direct PUT to R2 staging key
+   |
+   +--> Worker verifies, finalizes, and indexes canonical key
 ```
 
 ## Storage boundaries
 
-R2 is authoritative for object bytes and supports the internal multipart upload
-used for large NARs. D1 is authoritative for searchable metadata and lifecycle
+R2 is authoritative for object bytes and supports both the internal multipart
+upload used for normal Worker PUTs and the staging objects used by direct
+uploads. D1 is authoritative for searchable metadata and lifecycle
 state: object indexes, narinfo-to-NAR references, packages, versions, tags,
 policies, pins, jobs, and audit records. A D1 row must never be treated as a replacement
 for an R2 object; narinfo acceptance checks both.
+
+Direct upload staging keys use the `_nix_uploads/` prefix and are never served
+by cache routes or indexed as cache objects. A completion request streams the
+staging object through the Worker, recomputes SHA-256, and conditionally creates
+the canonical `/nar/` object before writing its D1 row. Scheduled cleanup
+removes expired and completed staging sessions in bounded batches.
 
 ## Package/version hierarchy
 

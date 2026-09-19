@@ -23,6 +23,12 @@ The storage responsibilities are deliberately separated:
 
 The cache is designed to work directly with `nix copy --to` and `nix copy --from`.
 
+NARs that exceed the Worker request-body limit use the separate authenticated
+direct-upload API. The client creates a session, uploads one file PUT to the
+returned R2 presigned URL, and then calls the completion endpoint. The Worker
+verifies the staged bytes before making the final immutable cache object
+visible and indexing it in D1.
+
 ## Cache API
 
 The cache uses the conventional Nix binary-cache paths.
@@ -35,6 +41,13 @@ The cache uses the conventional Nix binary-cache paths.
 | `PUT` | `/<hash>.narinfo` | Upload NAR metadata | Write or admin token |
 | `PUT` | `/nar/<path>` | Upload NAR payload | Write or admin token |
 
+Large-NAR control-plane endpoints:
+
+| Method | Path | Purpose | Auth |
+| --- | --- | --- | --- |
+| `POST` | `/api/uploads` | Create a direct R2 upload session | Write or admin token |
+| `POST` | `/api/uploads/{uploadId}/complete` | Verify and finalize the staged NAR | Write or admin token |
+
 ### HTTP behavior
 
 - `GET` and `HEAD` return the same cache metadata headers; `HEAD` does not return a body.
@@ -45,7 +58,9 @@ The cache uses the conventional Nix binary-cache paths.
 - Missing objects return `404 Not Found`.
 - Malformed narinfo returns `422 Unprocessable Content`; a narinfo whose NAR dependency is missing returns `424 Failed Dependency`.
 - Cache objects are immutable. A repeated PUT with identical bytes is an idempotent success; a PUT with different bytes never overwrites the existing object and returns a conflict response.
-- R2 multipart upload is used internally for large NAR payloads. Clients continue to use the normal Nix `PUT` protocol; no custom multipart client API is required.
+- R2 multipart upload is used internally for normal Worker PUTs. NARs larger
+  than the Worker request-body limit use the direct single-PUT API; the R2
+  presigned URL is not a multipart or resumable protocol.
 - The Worker uses Cloudflare's `caches.default` for successful full GET
   responses and `/nix-cache-info`. HEAD can reuse a cached full GET; Range and
   conditional requests continue through the R2 path. Cache generations change
@@ -85,7 +100,7 @@ The supported upload order is therefore:
 2. Upload the corresponding `.narinfo`.
 3. Optionally register the resulting narinfo objects into a package version.
 
-This strict mode avoids serving metadata for an unavailable payload. The implementation must preserve this invariant even when uploads are retried or completed through multipart upload.
+This strict mode avoids serving metadata for an unavailable payload. The implementation must preserve this invariant even when uploads are retried, finalized through the direct-upload flow, or completed through internal multipart upload.
 
 ## Authentication
 

@@ -6,6 +6,12 @@ export type Bindings = {
   READ_TOKEN?: string;
   WRITE_TOKEN?: string;
   ADMIN_TOKEN?: string;
+  R2_ACCOUNT_ID?: string;
+  R2_BUCKET_NAME?: string;
+  R2_S3_ENDPOINT?: string;
+  R2_S3_ACCESS_KEY_ID?: string;
+  R2_S3_SECRET_ACCESS_KEY?: string;
+  DIRECT_UPLOAD_URL_TTL_SECONDS?: string;
   DEFAULT_STORE_DIR?: string;
   DEFAULT_PRIORITY?: string;
   DEFAULT_WANT_MASS_QUERY?: string;

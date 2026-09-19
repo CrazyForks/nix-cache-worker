@@ -45,11 +45,17 @@ DEFAULT_PRIORITY=40
 DEFAULT_WANT_MASS_QUERY=1
 DEFAULT_RETENTION_DAYS=7
 NIX_PUBLIC_SIGN_KEY=<optional-public-signing-key>
+R2_ACCOUNT_ID=<cloudflare-account-id>
+R2_BUCKET_NAME=<cache-bucket-name>
+DIRECT_UPLOAD_URL_TTL_SECONDS=3600
 ```
 
 `NIX_PUBLIC_SIGN_KEY` is public metadata used by the home page's Nix client
 example. The product footer always links to the canonical project repository.
 Neither setting is a bearer secret.
+`R2_ACCOUNT_ID` and `R2_BUCKET_NAME` are used to construct the R2 S3 endpoint
+for presigned URLs. Presigned URLs use the R2 S3 API hostname and cannot use
+the Worker's custom domain.
 
 ## Worker Secrets
 
@@ -60,12 +66,18 @@ Cloudflare Dashboard:
 npx wrangler secret put READ_TOKEN
 npx wrangler secret put WRITE_TOKEN
 npx wrangler secret put ADMIN_TOKEN
+npx wrangler secret put R2_S3_ACCESS_KEY_ID
+npx wrangler secret put R2_S3_SECRET_ACCESS_KEY
 ```
 
 Keep the values out of shell history where possible and never print them.
 `READ_TOKEN` permits authenticated reads, `WRITE_TOKEN` permits cache writes
 and version registration, and `ADMIN_TOKEN` permits policy, pin, GC, and
 version-deletion operations. Anonymous cache reads remain enabled.
+
+The R2 S3 credentials must be a bucket-scoped R2 API token with object read and
+write permissions. They are used only by the Worker to create short-lived
+presigned URLs and must never be sent to CI clients.
 
 ## Nix clients and publishers
 
@@ -83,8 +95,36 @@ machine cache.example.org login nix password <WRITE_TOKEN>
 ```
 
 The management console also shows the standard `nix copy` and version
-registration commands after an administrator logs in. No custom upload
-protocol is required.
+registration commands after an administrator logs in. Standard `nix copy`
+remains the compatibility path for ordinary-sized objects. A NAR larger than
+the Worker request-body limit must use the direct-upload API:
+
+```text
+POST /api/uploads
+Authorization: Bearer <WRITE_TOKEN>
+Content-Type: application/json
+
+{"key":"nar/example.nar","size":123456789,"sha256":"<lowercase sha256>"}
+```
+
+The response contains `uploadId`, `uploadUrl`, and `uploadHeaders`. Send one
+direct `PUT` to `uploadUrl` with those headers and the exact file length, then
+complete the session:
+
+```bash
+curl --fail-with-body -X PUT "$UPLOAD_URL" \
+  -H 'Content-Type: application/octet-stream' \
+  -H 'If-None-Match: *' \
+  --data-binary @result.nar
+
+curl --fail-with-body -X POST \
+  "https://cache.example.org/api/uploads/$UPLOAD_ID/complete" \
+  -H "Authorization: Bearer $WRITE_TOKEN"
+```
+
+Only after completion should the corresponding `.narinfo` be uploaded through
+the normal cache PUT path. The direct flow uses one R2 single-object PUT and is
+not resumable; its maximum is the R2 single-upload limit.
 
 ## Package/version lifecycle
 

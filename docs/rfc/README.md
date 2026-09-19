@@ -53,3 +53,4 @@ The RFCs currently recorded are:
 - [RFC-0013: precise admin registration and retention time display](RFC-0013-admin-time-precision.md)
 - [RFC-0014: scheduled and manual GC execution](RFC-0014-gc-scheduling-and-manual-execution.md)
 - [RFC-0015: retention group capacity](RFC-0015-retention-group-capacity.md)
+- [RFC-0016: presigned single-PUT uploads for large NARs](RFC-0016-presigned-single-put-uploads.md)

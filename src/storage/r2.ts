@@ -18,7 +18,7 @@ export type UploadResult = {
   sha256: string;
 };
 
-function metadata(kind: ObjectKind): R2HTTPMetadata {
+export function httpMetadataFor(kind: ObjectKind): R2HTTPMetadata {
   return {
     contentType: contentTypeFor(kind),
     cacheControl: cacheControlFor(kind),
@@ -52,7 +52,7 @@ export async function claimObjectWrite(env: Bindings, key: string): Promise<stri
   return result.meta.changes === 1 ? owner : null;
 }
 
-async function renewWrite(env: Bindings, key: string, owner: string): Promise<void> {
+export async function renewObjectWrite(env: Bindings, key: string, owner: string): Promise<void> {
   const expiresAt = new Date(Date.now() + WRITE_CLAIM_TTL_MS).toISOString();
   const result = await env.DB.prepare("UPDATE write_claims SET expires_at = ? WHERE r2_key = ? AND owner = ?")
     .bind(expiresAt, key, owner).run();
@@ -63,19 +63,52 @@ export async function releaseObjectWrite(env: Bindings, key: string, owner: stri
   await env.DB.prepare("DELETE FROM write_claims WHERE r2_key = ? AND owner = ?").bind(key, owner).run();
 }
 
-async function duplicateDecisionByDigest(
+export function streamWithWriteClaim(env: Bindings, key: string, owner: string, body: ReadableStream<Uint8Array>, length?: number): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  let lastRenewedAt = Date.now();
+  const renewing = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (Date.now() - lastRenewedAt >= WRITE_CLAIM_TTL_MS / 3) {
+          await renewObjectWrite(env, key, owner);
+          lastRenewedAt = Date.now();
+        }
+        if (result.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(result.value);
+      } catch (error) {
+        await reader.cancel(error).catch(() => undefined);
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  if (length === undefined) return renewing;
+  const fixed = new FixedLengthStream(length);
+  void renewing.pipeTo(fixed.writable).catch(() => undefined);
+  return fixed.readable;
+}
+
+export async function duplicateDecisionByDigest(
   env: Bindings,
   key: string,
   kind: ObjectKind,
   incoming: { sha256: string; size: number },
   existing: R2Object,
   indexed: Awaited<ReturnType<typeof getObject>>,
+  owner?: string,
 ): Promise<UploadResult> {
   let existingSha256 = indexed?.sha256;
   if (!existingSha256) {
     const stored = await env.CACHE_BUCKET.get(key);
+    emitMetric("r2_get", { key, kind, operation: "get", status: stored ? 200 : 404, bytes: stored?.size ?? 0, directUpload: Boolean(owner) });
     if (!stored?.body) throw new AppError("orphaned_object", "The object exists in R2 but cannot be read for index repair", 503);
-    const storedDigest = await hashStream(stored.body);
+    const storedDigest = await hashStream(owner ? streamWithWriteClaim(env, key, owner, stored.body, existing.size) : stored.body);
     existingSha256 = storedDigest.sha256;
   }
   if (incoming.sha256 !== existingSha256 || incoming.size !== existing.size) {
@@ -111,7 +144,7 @@ async function duplicateDecision(env: Bindings, key: string, kind: ObjectKind, r
 
 async function multipartPut(env: Bindings, key: string, kind: ObjectKind, request: Request, owner: string): Promise<UploadResult> {
   if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
-  const upload = await env.CACHE_BUCKET.createMultipartUpload(key, { httpMetadata: metadata(kind) });
+  const upload = await env.CACHE_BUCKET.createMultipartUpload(key, { httpMetadata: httpMetadataFor(kind) });
   const reader = request.body.getReader();
   const hash = new Sha256();
   const parts: R2UploadedPart[] = [];
@@ -124,7 +157,7 @@ async function multipartPut(env: Bindings, key: string, kind: ObjectKind, reques
       const result = await reader.read();
       if (result.done) break;
       if (Date.now() - lastRenewedAt >= WRITE_CLAIM_TTL_MS / 3) {
-        await renewWrite(env, key, owner);
+        await renewObjectWrite(env, key, owner);
         lastRenewedAt = Date.now();
       }
       const chunk = result.value;
@@ -138,7 +171,7 @@ async function multipartPut(env: Bindings, key: string, kind: ObjectKind, reques
         const part = pending.slice(0, PART_SIZE);
         pending = pending.slice(PART_SIZE);
         parts.push(await upload.uploadPart(partNumber, part));
-        await renewWrite(env, key, owner);
+        await renewObjectWrite(env, key, owner);
         lastRenewedAt = Date.now();
         partNumber += 1;
       }
@@ -146,7 +179,7 @@ async function multipartPut(env: Bindings, key: string, kind: ObjectKind, reques
     if (pending.byteLength > 0 || parts.length === 0) {
       parts.push(await upload.uploadPart(partNumber, pending));
     }
-    await renewWrite(env, key, owner);
+    await renewObjectWrite(env, key, owner);
     const object = await upload.complete(parts);
     emitMetric("r2_put", { key, kind, status: 201, duplicate: false, bytes: size, multipart: true });
     return { object, duplicate: false, sha256: hash.digest() };
@@ -216,7 +249,7 @@ export async function putImmutableObject(env: Bindings, key: string, kind: Objec
     const hashPromise = hashStream(hashBody);
     const object = await env.CACHE_BUCKET.put(key, uploadBody, {
       onlyIf: { etagDoesNotMatch: "*" },
-      httpMetadata: metadata(kind),
+      httpMetadata: httpMetadataFor(kind),
     });
     const incoming = await hashPromise;
     if (!object) {

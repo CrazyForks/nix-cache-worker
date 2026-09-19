@@ -33,7 +33,9 @@ Edit the ignored `wrangler.jsonc` and set:
 3. `DB` to the D1 database name and IDs for the target environment.
 4. `NIX_PUBLIC_SIGN_KEY` to the public key used by your signed narinfos, if
    signature verification is enabled.
-5. An optional custom-domain route in the Cloudflare Dashboard or in the
+5. `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, and optionally
+   `DIRECT_UPLOAD_URL_TTL_SECONDS` for large direct NAR uploads.
+6. An optional custom-domain route in the Cloudflare Dashboard or in the
    private Wrangler file.
 
 The example uses placeholder resource names and the all-zero UUID only to make
@@ -55,9 +57,9 @@ Wrangler file. Keep production and preview/local resources separate when the
 deployment workflow requires isolation.
 
 The D1 binding must use `migrations_dir: "migrations"`. The Cron trigger in the
-template runs at 00:00, 08:00, and 16:00 UTC and enqueues bounded GC work. The repository
-now contains one squashed baseline migration; future schema changes start at
-`0002`.
+template runs at 00:00, 08:00, and 16:00 UTC and enqueues bounded GC work. The
+direct-upload feature adds the forward-only
+`0004_presigned_upload_sessions.sql` migration.
 
 ## 3. Apply D1 migrations
 
@@ -92,6 +94,8 @@ it in the repository:
 npx wrangler secret put READ_TOKEN
 npx wrangler secret put WRITE_TOKEN
 npx wrangler secret put ADMIN_TOKEN
+npx wrangler secret put R2_S3_ACCESS_KEY_ID
+npx wrangler secret put R2_S3_SECRET_ACCESS_KEY
 ```
 
 Use long, independently generated values. Keep them in the CI secret store or
@@ -120,6 +124,10 @@ If narinfos are signed, set `NIX_PUBLIC_SIGN_KEY` to the matching public key,
 deploy again, and verify that the public `/` page displays the expected key.
 Never upload or commit the corresponding private signing key.
 
+For direct NAR uploads, create the R2 S3 API token with object read/write
+permissions scoped to the cache bucket. The presigned URL uses the R2 S3 API
+hostname, not the Worker custom domain. Keep its URL out of logs and CI output.
+
 ## 7. Verify the deployment
 
 Check the following in order:
@@ -134,10 +142,12 @@ perform an end-to-end test from a controlled Nix client:
 
 1. Upload a NAR with `nix copy --to` using a temporary netrc whose file mode is
    `0600`.
-2. Upload or observe the corresponding narinfo.
-3. Register the package/version with the write-token API.
-4. Read the result with `nix copy --from` or `nix store cat --store`.
-5. Test a Range request and inspect the Worker logs for safe structured events.
+2. For a NAR larger than the Worker request limit, call `POST /api/uploads`,
+   PUT the file to the returned R2 URL, and call the completion endpoint.
+3. Upload or observe the corresponding narinfo.
+4. Register the package/version with the write-token API.
+5. Read the result with `nix copy --from` or `nix store cat --store`.
+6. Test a Range request and inspect the Worker logs for safe structured events.
 
 Replace `cache.example.org` with the real HTTPS hostname. Do not paste real
 tokens into these commands or into documentation.

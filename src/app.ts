@@ -6,6 +6,7 @@ import { AppError, isAppError } from "./domain/errors";
 import { adminRoutes } from "./routes/admin";
 import { cacheRoutes } from "./routes/cache";
 import { versionRoutes } from "./routes/versions";
+import { uploadRoutes } from "./routes/uploads";
 import { adminPage } from "./ui/admin";
 import { homePage } from "./ui/home";
 
@@ -33,6 +34,7 @@ app.get("/admin", (c) => adminPage(new URL(c.req.url).origin));
 app.get("/", (c) => homePage(c.env.NIX_PUBLIC_SIGN_KEY, new URL(c.req.url).origin));
 app.route("", adminRoutes);
 app.route("", versionRoutes);
+app.route("", uploadRoutes);
 app.route("", cacheRoutes);
 
 app.notFound((c) => c.json({ error: { code: "not_found", message: "Not found", requestId: c.get("requestId") ?? "unknown" } }, 404));

@@ -3,6 +3,8 @@ import { env } from "cloudflare:workers";
 import { app } from "../src/app";
 import { createDeletionJob, runQueuedJobs, scheduleGcJob } from "../src/jobs/jobs";
 import { claimObjectWrite, releaseObjectWrite } from "../src/storage/r2";
+import { createPresignedPut } from "../src/storage/presign";
+import { cleanupUploadSessions } from "../src/storage/uploads";
 import type { Bindings } from "../src/env";
 import { homePage } from "../src/ui/home";
 
@@ -12,11 +14,14 @@ const testEnv = {
   WRITE_TOKEN: "write-secret",
   ADMIN_TOKEN: "admin-secret",
   NIX_PUBLIC_SIGN_KEY: "",
+  R2_ACCOUNT_ID: "00000000000000000000000000000000",
+  R2_BUCKET_NAME: "nix-cache-test",
+  R2_S3_ACCESS_KEY_ID: "test-access-key",
+  R2_S3_SECRET_ACCESS_KEY: "test-secret-key",
 } as Bindings;
 
 beforeAll(async () => {
-  await testEnv.DB.exec(`
-    PRAGMA foreign_keys = OFF;
+  const schema = `
     DROP TABLE IF EXISTS artifact_version_members;
     DROP TABLE IF EXISTS artifact_versions;
     DROP TABLE IF EXISTS artifact_packages;
@@ -34,7 +39,7 @@ beforeAll(async () => {
     DROP TABLE IF EXISTS delete_job_narinfos;
     DROP TABLE IF EXISTS write_claims;
     DROP TABLE IF EXISTS audit_log;
-    PRAGMA foreign_keys = ON;
+    DROP TABLE IF EXISTS upload_sessions;
     CREATE TABLE artifact_packages (package_name TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE objects (r2_key TEXT PRIMARY KEY, kind TEXT NOT NULL, etag TEXT NOT NULL, sha256 TEXT, size INTEGER NOT NULL, uploaded_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'ready');
     CREATE TABLE narinfo_refs (narinfo_key TEXT PRIMARY KEY, nar_key TEXT NOT NULL, store_path TEXT, created_at TEXT NOT NULL);
@@ -46,13 +51,20 @@ beforeAll(async () => {
     CREATE TABLE write_claims (r2_key TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at TEXT NOT NULL);
     CREATE INDEX idx_write_claims_expires_at ON write_claims(expires_at);
     CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, actor TEXT NOT NULL, target TEXT, details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+    CREATE TABLE upload_sessions (id TEXT PRIMARY KEY, r2_key TEXT NOT NULL, staging_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, expected_size INTEGER NOT NULL, expected_sha256 TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'issued', object_etag TEXT, error_code TEXT, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, completed_at TEXT, updated_at TEXT NOT NULL);
+    CREATE INDEX idx_upload_sessions_expiry ON upload_sessions(status, expires_at);
+    CREATE INDEX idx_upload_sessions_key ON upload_sessions(r2_key, status, created_at DESC);
+    CREATE UNIQUE INDEX idx_upload_sessions_active_key ON upload_sessions(r2_key) WHERE status = 'issued';
     CREATE TABLE gc_scan_versions (job_id TEXT NOT NULL, version_id TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(job_id, version_id));
     CREATE TABLE gc_policy_matches (job_id TEXT NOT NULL, version_id TEXT NOT NULL, policy_id INTEGER NOT NULL, group_key TEXT NOT NULL, registered_at TEXT NOT NULL, keep_count INTEGER NOT NULL, PRIMARY KEY(job_id, version_id, policy_id));
     CREATE TABLE gc_policy_capacity_matches (job_id TEXT NOT NULL, version_id TEXT NOT NULL, policy_id INTEGER NOT NULL, group_key TEXT NOT NULL, registered_at TEXT NOT NULL, capacity_versions INTEGER NOT NULL, PRIMARY KEY(job_id, version_id, policy_id));
     CREATE TABLE delete_job_nars (job_id TEXT NOT NULL, nar_key TEXT NOT NULL, PRIMARY KEY(job_id, nar_key));
     CREATE TABLE delete_job_narinfos (job_id TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(job_id, narinfo_key));
     CREATE UNIQUE INDEX idx_jobs_active_delete_target ON jobs(target_version_id) WHERE type = 'delete_version' AND target_version_id IS NOT NULL AND status IN ('queued', 'running', 'failed');
-  `);
+  `;
+  for (const statement of schema.split(";")) {
+    if (statement.trim()) await testEnv.DB.exec(statement);
+  }
   await testEnv.DB.prepare(
     "INSERT INTO gc_policies (name, conditions_json, group_by_json, last_n, duration_days, capacity_versions, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
   ).bind("default-package-tags", "[]", '["pkg_name","pkg_tags"]', 3, null, null, "2026-08-01T00:00:00.000Z", "2026-08-01T00:00:00.000Z").run();
@@ -97,6 +109,58 @@ async function register(packageName: string, versionName: string, narinfoKeys: s
     headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
     body: JSON.stringify({ narinfoKeys, ...extra }),
   });
+}
+
+async function sha256Bytes(value: Uint8Array): Promise<string> {
+  const bytes = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function awsEncodeForTest(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function hexBytes(value: Uint8Array): string {
+  return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function hmacBytes(key: Uint8Array, value: string): Promise<Uint8Array> {
+  const keyBuffer = key.buffer.slice(key.byteOffset, key.byteOffset + key.byteLength) as ArrayBuffer;
+  const cryptoKey = await crypto.subtle.importKey("raw", keyBuffer, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(value));
+  return new Uint8Array(signature);
+}
+
+async function referencePresignedSignature(url: string, headers: Record<string, string>, secret: string): Promise<string> {
+  const parsed = new URL(url);
+  const query = Array.from(parsed.searchParams.entries())
+    .filter(([name]) => name !== "X-Amz-Signature")
+    .map(([name, value]) => [awsEncodeForTest(name), awsEncodeForTest(value)] as const)
+    .sort(([leftName, leftValue], [rightName, rightValue]) => leftName.localeCompare(rightName) || leftValue.localeCompare(rightValue))
+    .map(([name, value]) => `${name}=${value}`)
+    .join("&");
+  const signedHeaders = parsed.searchParams.get("X-Amz-SignedHeaders") ?? "";
+  const requestHeaders = new Map(Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]));
+  requestHeaders.set("host", parsed.host);
+  const canonicalHeaders = signedHeaders.split(";").map((name) => `${name}:${(requestHeaders.get(name) ?? "").trim().replace(/[\t ]+/g, " ")}`).join("\n");
+  const canonicalRequest = ["PUT", parsed.pathname, query, `${canonicalHeaders}\n`, signedHeaders, "UNSIGNED-PAYLOAD"].join("\n");
+  const requestDigest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalRequest));
+  const date = parsed.searchParams.get("X-Amz-Date") ?? "";
+  const scope = parsed.searchParams.get("X-Amz-Credential")?.split("/").slice(1).join("/") ?? "";
+  const stringToSign = ["AWS4-HMAC-SHA256", date, scope, hexBytes(new Uint8Array(requestDigest))].join("\n");
+  const dateKey = await hmacBytes(new TextEncoder().encode(`AWS4${secret}`), date.slice(0, 8));
+  const regionKey = await hmacBytes(dateKey, "auto");
+  const serviceKey = await hmacBytes(regionKey, "s3");
+  const signingKey = await hmacBytes(serviceKey, "aws4_request");
+  return hexBytes(await hmacBytes(signingKey, stringToSign));
+}
+
+function stagingKeyFromPresignedUrl(url: string): string {
+  const pathname = decodeURIComponent(new URL(url).pathname);
+  const prefix = `/${testEnv.R2_BUCKET_NAME}/`;
+  expect(pathname.startsWith(prefix)).toBe(true);
+  return pathname.slice(prefix.length);
 }
 
 describe("Admin console page", () => {
@@ -339,6 +403,214 @@ describe("Nix cache HTTP API", () => {
     const replay = await request("/nar/multipart-retry.nar", { method: "PUT", headers, body });
     expect(replay.response.status).toBe(204);
     expect(replay.response.headers.get("ETag")).toBe(first.response.headers.get("ETag"));
+  });
+
+  it("requires write access for direct upload sessions", async () => {
+    const body = { key: "nar/direct-auth.nar", size: 1, sha256: "0".repeat(64) };
+    expect((await request("/api/uploads", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).response.status).toBe(403);
+    expect((await request("/api/uploads", { method: "POST", headers: { ...bearer("read-secret"), "Content-Type": "application/json" }, body: JSON.stringify(body) })).response.status).toBe(403);
+    expect((await request("/api/uploads", { method: "POST", headers: { ...bearer("write-secret"), "Content-Type": "application/json" }, body: JSON.stringify({ ...body, key: "not-a-narinfo.narinfo" }) })).response.status).toBe(422);
+    const created = await request("/api/uploads", { method: "POST", headers: { ...bearer("write-secret"), "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    expect(created.response.status).toBe(201);
+    const upload = await created.response.json<{ uploadId: string }>();
+    expect((await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST" })).response.status).toBe(403);
+    expect((await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST", headers: bearer("read-secret") })).response.status).toBe(403);
+  });
+
+  it("produces a verifiable SigV4 presigned PUT signature", async () => {
+    const presigned = await createPresignedPut(testEnv, "_nix_uploads/reference-vector", 3600, new Date("2026-01-02T03:04:05.000Z"));
+    const signature = new URL(presigned.url).searchParams.get("X-Amz-Signature");
+    expect(signature).toBe(await referencePresignedSignature(presigned.url, presigned.headers, testEnv.R2_S3_SECRET_ACCESS_KEY as string));
+  });
+
+  it("serializes concurrent direct-upload session initialization", async () => {
+    const body = { key: "nar/direct-concurrent-init.nar", size: 1, sha256: "0".repeat(64) };
+    const init = () => request("/api/uploads", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const results = await Promise.all([init(), init()]);
+    const statuses = results.map(({ response }) => response.status);
+    expect(statuses.filter((status) => status === 201)).toHaveLength(1);
+    expect(statuses.every((status) => status === 200 || status === 201 || status === 409)).toBe(true);
+    const successful = results.find(({ response }) => response.status === 201 || response.status === 200);
+    const upload = await successful?.response.json<{ uploadId: string }>();
+    if (upload?.uploadId) {
+      await testEnv.DB.prepare("UPDATE upload_sessions SET expires_at = ?, updated_at = ? WHERE id = ?")
+        .bind("2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", upload.uploadId).run();
+      await cleanupUploadSessions(testEnv, 10);
+    }
+  });
+
+  it("uploads a NAR directly to a presigned staging URL and finalizes it", async () => {
+    const body = new TextEncoder().encode("direct-upload-body");
+    const key = "nar/direct-finalize.nar";
+    const init = await request("/api/uploads", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ key, size: body.byteLength, sha256: await sha256Bytes(body) }),
+    });
+    expect(init.response.status).toBe(201);
+    const upload = await init.response.json<{ uploadId: string; uploadUrl: string; uploadHeaders: Record<string, string> }>();
+    expect(upload.uploadUrl).toContain("X-Amz-Signature=");
+    expect(upload.uploadUrl).toContain("X-Amz-Content-Sha256=UNSIGNED-PAYLOAD");
+    expect(upload.uploadUrl).not.toContain("test-secret-key");
+    expect(upload.uploadHeaders).toEqual({ "Content-Type": "application/octet-stream", "If-None-Match": "*" });
+
+    const stagingKey = stagingKeyFromPresignedUrl(upload.uploadUrl);
+    await testEnv.CACHE_BUCKET.put(stagingKey, body, { onlyIf: { etagDoesNotMatch: "*" } });
+    const complete = await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST", headers: bearer("write-secret") });
+    expect(complete.response.status).toBe(201);
+    expect(await complete.response.json<{ key: string; size: number; duplicate: boolean }>()).toMatchObject({ key, size: body.byteLength, duplicate: false });
+
+    const head = await request(`/${key}`, { method: "HEAD" });
+    expect(head.response.status).toBe(200);
+    expect(head.response.headers.get("Content-Length")).toBe(String(body.byteLength));
+    expect((await testEnv.DB.prepare("SELECT state, sha256 FROM objects WHERE r2_key = ?").bind(key).first<{ state: string; sha256: string }>())).toMatchObject({ state: "ready", sha256: await sha256Bytes(body) });
+    expect(await testEnv.CACHE_BUCKET.head(stagingKey)).not.toBeNull();
+    expect(await testEnv.CACHE_BUCKET.put(stagingKey, body, { onlyIf: { etagDoesNotMatch: "*" } })).toBeNull();
+
+    await testEnv.DB.prepare("UPDATE upload_sessions SET expires_at = ?, updated_at = ? WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", upload.uploadId).run();
+    const lateReplay = await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST", headers: bearer("write-secret") });
+    expect(lateReplay.response.status).toBe(200);
+    await cleanupUploadSessions(testEnv, 10);
+    expect(await testEnv.CACHE_BUCKET.head(stagingKey)).toBeNull();
+  });
+
+  it("keeps direct upload completion idempotent and enforces the narinfo dependency", async () => {
+    const body = new TextEncoder().encode("direct-idempotent-body");
+    const key = "nar/direct-idempotent.nar";
+    const init = await request("/api/uploads", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ key, size: body.byteLength, sha256: await sha256Bytes(body) }),
+    });
+    const upload = await init.response.json<{ uploadId: string; uploadUrl: string }>();
+    const beforeNarinfo = await request("/direct-idempotent.narinfo", {
+      method: "PUT",
+      headers: bearer("write-secret"),
+      body: narInfoBody(key, "/nix/store/direct-idempotent"),
+    });
+    expect(beforeNarinfo.response.status).toBe(424);
+    await testEnv.CACHE_BUCKET.put(stagingKeyFromPresignedUrl(upload.uploadUrl), body, { onlyIf: { etagDoesNotMatch: "*" } });
+    const first = await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST", headers: bearer("write-secret") });
+    expect(first.response.status).toBe(201);
+    const replay = await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST", headers: bearer("write-secret") });
+    expect(replay.response.status).toBe(200);
+    expect((await replay.response.json<{ duplicate: boolean }>()).duplicate).toBe(true);
+    const narinfo = await request("/direct-idempotent.narinfo", {
+      method: "PUT",
+      headers: bearer("write-secret"),
+      body: narInfoBody(key, "/nix/store/direct-idempotent"),
+    });
+    expect(narinfo.response.status).toBe(201);
+  });
+
+  it("rejects a direct upload with a wrong digest and cleans its staging object", async () => {
+    const body = new TextEncoder().encode("wrong-direct-digest");
+    const init = await request("/api/uploads", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ key: "nar/direct-wrong-digest.nar", size: body.byteLength, sha256: "f".repeat(64) }),
+    });
+    const upload = await init.response.json<{ uploadId: string; uploadUrl: string }>();
+    const stagingKey = stagingKeyFromPresignedUrl(upload.uploadUrl);
+    await testEnv.CACHE_BUCKET.put(stagingKey, body, { onlyIf: { etagDoesNotMatch: "*" } });
+    const complete = await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST", headers: bearer("write-secret") });
+    expect(complete.response.status).toBe(422);
+    expect((await testEnv.DB.prepare("SELECT status, error_code FROM upload_sessions WHERE id = ?").bind(upload.uploadId).first<{ status: string; error_code: string }>())).toMatchObject({ status: "failed", error_code: "upload_digest_mismatch" });
+    expect(await testEnv.CACHE_BUCKET.head(stagingKey)).not.toBeNull();
+    await testEnv.DB.prepare("UPDATE upload_sessions SET expires_at = ?, updated_at = ? WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", upload.uploadId).run();
+    await cleanupUploadSessions(testEnv, 10);
+    expect(await testEnv.CACHE_BUCKET.head(stagingKey)).toBeNull();
+    expect((await request("/nar/direct-wrong-digest.nar", { method: "HEAD" })).response.status).toBe(404);
+  });
+
+  it("rejects a direct upload with a wrong size", async () => {
+    const body = new TextEncoder().encode("wrong-direct-size");
+    const init = await request("/api/uploads", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ key: "nar/direct-wrong-size.nar", size: body.byteLength + 1, sha256: await sha256Bytes(body) }),
+    });
+    const upload = await init.response.json<{ uploadId: string; uploadUrl: string }>();
+    const stagingKey = stagingKeyFromPresignedUrl(upload.uploadUrl);
+    await testEnv.CACHE_BUCKET.put(stagingKey, body, { onlyIf: { etagDoesNotMatch: "*" } });
+    const complete = await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST", headers: bearer("write-secret") });
+    expect(complete.response.status).toBe(422);
+    expect((await testEnv.DB.prepare("SELECT status, error_code FROM upload_sessions WHERE id = ?").bind(upload.uploadId).first<{ status: string; error_code: string }>())).toMatchObject({ status: "failed", error_code: "upload_size_mismatch" });
+    expect(await testEnv.CACHE_BUCKET.head(stagingKey)).not.toBeNull();
+    await testEnv.DB.prepare("UPDATE upload_sessions SET expires_at = ?, updated_at = ? WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", upload.uploadId).run();
+    await cleanupUploadSessions(testEnv, 10);
+    expect(await testEnv.CACHE_BUCKET.head(stagingKey)).toBeNull();
+  });
+
+  it("preserves the normal PUT object when it wins the direct-upload race", async () => {
+    const directBody = new TextEncoder().encode("direct-race-body");
+    const key = "nar/direct-race.nar";
+    const init = await request("/api/uploads", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ key, size: directBody.byteLength, sha256: await sha256Bytes(directBody) }),
+    });
+    const upload = await init.response.json<{ uploadId: string; uploadUrl: string }>();
+    const stagingKey = stagingKeyFromPresignedUrl(upload.uploadUrl);
+    await testEnv.CACHE_BUCKET.put(stagingKey, directBody, { onlyIf: { etagDoesNotMatch: "*" } });
+    const normal = await request(`/${key}`, { method: "PUT", headers: bearer("write-secret"), body: "normal-race-body" });
+    expect(normal.response.status).toBe(201);
+    const complete = await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST", headers: bearer("write-secret") });
+    expect(complete.response.status).toBe(409);
+    expect(new TextDecoder().decode(await (await request(`/${key}`)).response.arrayBuffer())).toBe("normal-race-body");
+    await testEnv.DB.prepare("UPDATE upload_sessions SET expires_at = ?, updated_at = ? WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", upload.uploadId).run();
+    await cleanupUploadSessions(testEnv, 10);
+  });
+
+  it("does not treat a replaced completed object as an idempotent replay", async () => {
+    const body = new TextEncoder().encode("completed-object-original");
+    const key = "nar/direct-replaced-after-complete.nar";
+    const init = await request("/api/uploads", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ key, size: body.byteLength, sha256: await sha256Bytes(body) }),
+    });
+    const upload = await init.response.json<{ uploadId: string; uploadUrl: string }>();
+    await testEnv.CACHE_BUCKET.put(stagingKeyFromPresignedUrl(upload.uploadUrl), body, { onlyIf: { etagDoesNotMatch: "*" } });
+    expect((await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST", headers: bearer("write-secret") })).response.status).toBe(201);
+
+    await testEnv.CACHE_BUCKET.delete(key);
+    await testEnv.CACHE_BUCKET.put(key, new Uint8Array(body.byteLength).fill(88), { onlyIf: { etagDoesNotMatch: "*" } });
+    const replay = await request(`/api/uploads/${upload.uploadId}/complete`, { method: "POST", headers: bearer("write-secret") });
+    expect(replay.response.status).toBe(409);
+    await testEnv.DB.prepare("UPDATE upload_sessions SET expires_at = ?, updated_at = ? WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", upload.uploadId).run();
+    await cleanupUploadSessions(testEnv, 10);
+    await testEnv.CACHE_BUCKET.delete(key);
+    await testEnv.DB.prepare("DELETE FROM objects WHERE r2_key = ?").bind(key).run();
+  });
+
+  it("cleans expired direct-upload staging objects", async () => {
+    const body = new TextEncoder().encode("expired-direct-upload");
+    const init = await request("/api/uploads", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ key: "nar/direct-expired.nar", size: body.byteLength, sha256: await sha256Bytes(body) }),
+    });
+    expect(init.response.status).toBe(201);
+    const upload = await init.response.json<{ uploadId: string; uploadUrl: string }>();
+    const stagingKey = stagingKeyFromPresignedUrl(upload.uploadUrl);
+    await testEnv.CACHE_BUCKET.put(stagingKey, body, { onlyIf: { etagDoesNotMatch: "*" } });
+    await testEnv.DB.prepare("UPDATE upload_sessions SET expires_at = ?, updated_at = ? WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", upload.uploadId).run();
+
+    await cleanupUploadSessions(testEnv, 10);
+
+    expect(await testEnv.CACHE_BUCKET.head(stagingKey)).toBeNull();
+    expect(await testEnv.DB.prepare("SELECT id FROM upload_sessions WHERE id = ?").bind(upload.uploadId).first()).toBeNull();
   });
 
   it("uses strong If-Match and standard unsatisfied range responses", async () => {

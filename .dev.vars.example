@@ -3,3 +3,8 @@
 READ_TOKEN=replace-with-local-read-token
 WRITE_TOKEN=replace-with-local-write-token
 ADMIN_TOKEN=replace-with-local-admin-token
+R2_ACCOUNT_ID=replace-with-cloudflare-account-id
+R2_BUCKET_NAME=replace-with-r2-bucket-name
+R2_S3_ACCESS_KEY_ID=replace-with-bucket-scoped-r2-access-key
+R2_S3_SECRET_ACCESS_KEY=replace-with-bucket-scoped-r2-secret-key
+DIRECT_UPLOAD_URL_TTL_SECONDS=3600
