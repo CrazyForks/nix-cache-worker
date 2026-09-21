@@ -208,7 +208,11 @@ export async function completeUploadSession(env: Bindings, id: string): Promise<
     throw new AppError("upload_expired", "The direct-upload session has expired", 410);
   }
 
-  const owner = await claimObjectWrite(env, session.r2_key);
+  let owner: string | null = null;
+  for (let attempt = 0; attempt < 4 && !owner; attempt += 1) {
+    owner = await claimObjectWrite(env, session.r2_key);
+    if (!owner && attempt < 3) await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt));
+  }
   if (!owner) throw new AppError("upload_in_progress", "Another upload for this object is in progress", 409);
   try {
     if (session.status === "completed") {
