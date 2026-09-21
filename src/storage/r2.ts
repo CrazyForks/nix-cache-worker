@@ -42,12 +42,13 @@ export async function claimObjectWrite(env: Bindings, key: string): Promise<stri
     lastWriteClaimCleanupAt = currentTime;
     await env.DB.prepare("DELETE FROM write_claims WHERE expires_at < ?").bind(currentTimestamp).run();
   }
-  const result = await env.DB.prepare(
+  const claimed = await env.DB.prepare(
     `INSERT INTO write_claims (r2_key, owner, expires_at) VALUES (?, ?, ?)
      ON CONFLICT(r2_key) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at
-     WHERE write_claims.expires_at < ?`,
-  ).bind(key, owner, expiresAt, currentTimestamp).run();
-  return result.meta.changes === 1 ? owner : null;
+     WHERE write_claims.expires_at < ?
+     RETURNING owner`,
+  ).bind(key, owner, expiresAt, currentTimestamp).first<{ owner: string }>();
+  return claimed?.owner === owner ? owner : null;
 }
 
 export async function renewObjectWrite(env: Bindings, key: string, owner: string): Promise<void> {
