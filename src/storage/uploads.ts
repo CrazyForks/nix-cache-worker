@@ -117,7 +117,6 @@ export async function expireStaleUploadSession(
 export async function createUploadSession(
   env: Bindings,
   input: { key: string; size: number; sha256: string },
-  owner?: string,
 ): Promise<{ session: UploadSessionRow; presigned: Awaited<ReturnType<typeof createPresignedPut>> }> {
   const id = crypto.randomUUID();
   const createdAt = now();
@@ -125,19 +124,36 @@ export async function createUploadSession(
   const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
   const stagingKey = stagingKeyForSession(id);
   const presigned = await createPresignedPut(env, stagingKey, ttl, new Date(createdAt));
-  const insert = env.DB.prepare(
+  const result = await env.DB.prepare(
     `INSERT INTO upload_sessions (
        id, r2_key, staging_key, kind, expected_size, expected_sha256, status,
        created_at, expires_at, updated_at
-     ) VALUES (?, ?, ?, 'nar', ?, ?, 'issued', ?, ?, ?)`,
-  ).bind(id, input.key, stagingKey, input.size, input.sha256, createdAt, expiresAt, createdAt);
-  if (owner) {
-    await env.DB.batch([
-      insert,
-      env.DB.prepare("DELETE FROM write_claims WHERE r2_key = ? AND owner = ?").bind(input.key, owner),
-    ]);
-  } else {
-    await insert.run();
+     )
+     SELECT ?, ?, ?, 'nar', ?, ?, 'issued', ?, ?, ?
+     WHERE NOT EXISTS (
+       SELECT 1 FROM objects WHERE r2_key = ? AND state = 'deleting'
+     )
+       AND NOT EXISTS (
+         SELECT 1 FROM upload_sessions WHERE r2_key = ? AND status = 'issued'
+       )`,
+  ).bind(
+    id,
+    input.key,
+    stagingKey,
+    input.size,
+    input.sha256,
+    createdAt,
+    expiresAt,
+    createdAt,
+    input.key,
+    input.key,
+  ).run();
+  if (result.meta.changes !== 1) {
+    const deleting = await env.DB.prepare(
+      "SELECT 1 AS present FROM objects WHERE r2_key = ? AND state = 'deleting'",
+    ).bind(input.key).first<{ present: number }>();
+    if (deleting) throw new AppError("object_deleting", "The object is currently being deleted", 409);
+    throw new AppError("upload_in_progress", "Another direct upload for this object is in progress", 409);
   }
   const session = await getUploadSession(env, id);
   if (!session) throw new AppError("upload_session_failed", "The upload session could not be created", 503);
