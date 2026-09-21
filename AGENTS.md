@@ -31,7 +31,10 @@ The project is a storage target for CI-driven package publishing. CI builds pack
 
 ## Cache compatibility
 
-All cache changes must preserve direct compatibility with `nix copy --to` and `nix copy --from`.
+All cache changes must preserve direct compatibility with `nix copy --from`
+reads. Publishing stays compatible through `bin/nix-cache-upload` and
+authenticated narinfo PUTs; ordinary NAR PUT is intentionally rejected (see
+RFC-0022).
 
 Maintain support for:
 
@@ -40,10 +43,13 @@ Maintain support for:
 - ETag, `If-None-Match`, and `If-Match` semantics.
 - Accurate `Content-Length` and `Content-Range` headers.
 - Standard `/nix-cache-info`, `.narinfo`, and `/nar/*` paths.
-- Multipart upload for large NAR objects.
-- Internal R2 multipart must remain invisible to normal Nix clients, which continue to use standard PUT.
+- Authenticated `.narinfo` PUTs through the Worker; NAR payloads use the
+  staging direct-upload session flow (`POST /api/uploads`, PUT to
+  `_nix_uploads/<uploadId>`, `POST /api/uploads/<uploadId>/complete`).
+  Ordinary `PUT /nar/*` returns `405 direct_upload_required`.
 
-Do not introduce a custom upload protocol as a prerequisite for normal Nix cache operation.
+Do not introduce a custom upload protocol beyond the staging direct-upload
+API as a prerequisite for normal Nix cache operation.
 
 ## Immutability and consistency
 
@@ -51,7 +57,7 @@ Do not introduce a custom upload protocol as a prerequisite for normal Nix cache
 - A different-content PUT must never overwrite an existing object.
 - Conditional request failures must be reported with the correct HTTP precondition status.
 - Uploading a narinfo before its NAR is available must fail in strict consistency mode.
-- Retries and multipart completion must not create duplicate or partially visible cache objects.
+- Retries and direct-upload completion must not create duplicate or partially visible cache objects.
 
 ## Artifact sets, policies, and GC
 
@@ -101,7 +107,7 @@ Changes affecting cache behavior should include tests for the relevant scenarios
 - GET, HEAD, Range, ETag, conditional requests, and Content-Length.
 - Same-content idempotent PUT and different-content conflict.
 - Missing-NAR rejection for narinfo upload.
-- Multipart upload completion and retry behavior.
+- Direct-upload completion and retry behavior.
 - Package/version registration idempotency and arbitrary tags.
 - Glob selector matching and `keepLatestVersions` ordering by `registered_at` per package.
 - Pin protection during automatic GC.

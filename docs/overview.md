@@ -21,13 +21,11 @@ The storage responsibilities are deliberately separated:
 - **D1** is the index and control plane for objects and package/version metadata.
 - **Worker Secrets** are the source of truth for bearer tokens.
 
-The cache is designed to work directly with `nix copy --to` and `nix copy --from`.
-
-NARs that exceed the Worker request-body limit use the separate authenticated
-direct-upload API. The client creates a session, uploads one file PUT to the
-returned R2 presigned URL, and then calls the completion endpoint. The Worker
-verifies the staged bytes before making the final immutable cache object
-visible and indexing it in D1.
+`bin/nix-cache-upload` is the supported zero-compile CI publisher. It exports a
+complete local file cache, uploads every unique NAR to a random staging key,
+completes the session through the Worker, publishes narinfos, and registers an
+explicit package/version. Ordinary NAR PUT requests are intentionally rejected;
+this is a non-compatible full rebuild.
 
 ## Cache API
 
@@ -39,14 +37,26 @@ The cache uses the conventional Nix binary-cache paths.
 | `GET`, `HEAD` | `/<hash>.narinfo` | NAR metadata | Public read or read token |
 | `GET`, `HEAD` | `/nar/<path>` | NAR payload | Public read or read token |
 | `PUT` | `/<hash>.narinfo` | Upload NAR metadata | Write or admin token |
-| `PUT` | `/nar/<path>` | Upload NAR payload | Write or admin token |
+| `PUT` | `/nar/<path>` | Rejected; use the direct-upload API | Write or admin token |
 
-Large-NAR control-plane endpoints:
+Direct NAR upload control-plane endpoints:
 
 | Method | Path | Purpose | Auth |
 | --- | --- | --- | --- |
-| `POST` | `/api/uploads` | Create a direct R2 upload session | Write or admin token |
-| `POST` | `/api/uploads/{uploadId}/complete` | Verify and finalize the staged NAR | Write or admin token |
+| `POST` | `/api/uploads` | Create a staging NAR upload session | Write or admin token |
+| `POST` | `/api/uploads/<uploadId>/complete` | Verify staging and promote the NAR | Write or admin token |
+
+There is no Worker NAR upload endpoint. `PUT /nar/*` returns
+`405 direct_upload_required`; only `.narinfo` metadata is written with a
+Worker `PUT`.
+
+`POST /api/uploads` accepts `{ "key", "size", "sha256" }` and returns an
+`uploadId` plus a presigned PUT for `_nix_uploads/<uploadId>`. After the
+staging PUT, call `/api/uploads/<uploadId>/complete`. Completion verifies the
+staging object, conditionally promotes it to the final key, and indexes it in
+D1. Wrong staging content is never promoted. Sessions and staging objects are
+cleaned after expiry; deleting a final object removes its D1 row after R2
+deletion, with no tombstone.
 
 ### HTTP behavior
 
@@ -58,41 +68,42 @@ Large-NAR control-plane endpoints:
 - Missing objects return `404 Not Found`.
 - Malformed narinfo returns `422 Unprocessable Content`; a narinfo whose NAR dependency is missing returns `424 Failed Dependency`.
 - Cache objects are immutable. A repeated PUT with identical bytes is an idempotent success; a PUT with different bytes never overwrites the existing object and returns a conflict response.
-- R2 multipart upload is used internally for normal Worker PUTs. NARs larger
-  than the Worker request-body limit use the direct single-PUT API; the R2
-  presigned URL is not a multipart or resumable protocol.
-- The Worker uses Cloudflare's `caches.default` for successful full GET
-  responses and `/nix-cache-info`. HEAD can reuse a cached full GET; Range and
-  conditional requests continue through the R2 path. Cache generations change
-  when version metadata, retention rules, settings, or deletion state changes.
+- NAR payloads never enter the Worker upload path. Narinfo PUTs remain
+  Worker-managed so reference counters can be updated atomically.
+- Cache object GET and HEAD requests redirect to a presigned R2 URL without a
+  D1 lookup or R2 `HEAD`; the redirect is `no-store`. Worker Cache is retained
+  only for the generated `/nix-cache-info` response. A `HEAD` request with a
+  `Range` header uses the binding fallback for exact range metadata.
 
 ### Cache-Control defaults
 
 | Path | Header |
 | --- | --- |
-| Unclassified `/nar/*` or `*.narinfo` | `public, max-age=21600` (NAR responses also include `immutable`) |
-| Version-associated `/nar/*` or `*.narinfo` | `public, max-age=<effective retention in seconds>` (NAR responses also include `immutable`) |
+| `/nar/*` and `*.narinfo` | `public, max-age=31536000, immutable` |
 | `/nix-cache-info` | `public, max-age=300` |
 
-Objects uploaded before version registration are intentionally served with a
-six-hour TTL. Once a narinfo is associated with an active version, both the
-narinfo and its referenced NAR use the longest effective finite retention among
-their active versions. A version-level `retentionDays` override wins for that
-version; otherwise the largest matching structured rule duration and then the
-system default are used. This TTL is calculated when serving the response, so
-registering or updating a version does not require rewriting immutable R2 bytes.
+Retention and deletion state never change object HTTP TTL. R2 Custom Domain
+deployments should apply a long edge TTL to `/nix-cache-info`, `/*.narinfo`, and
+`/nar/*`, including cached 404s. The cache-info object keeps its five-minute
+client cache header so deployment configuration changes are not immutable at
+the public URL. Stale content after deletion is accepted.
 
 ### `nix-cache-info`
 
-The Worker returns the standard cache information document, including the configured store directory, `WantMassQuery`, and cache priority. The response is intentionally short-lived so cache metadata changes can propagate without delaying NAR downloads.
+The Worker returns the standard cache information document from Wrangler
+variables. It does not query D1. For an R2 Custom Domain, deployment writes
+the same bytes to the R2 `nix-cache-info` object. Worker Cache keys include the
+public cache-info values, so redeploying with new values does not reuse the old
+Worker-generated response.
 
 ### NARINFO consistency
 
 When a `.narinfo` is uploaded, the Worker validates the core Nix metadata fields,
 parses the referenced NAR URL, and verifies that the NAR object already exists in
 R2 and in the D1 object index. The narinfo is rejected when the metadata is
-malformed or the referenced NAR is missing. The dependency key is held through
-the index update so a deletion cannot race the consistency check.
+malformed or the referenced NAR is missing. The NAR reference and its
+`narinfo_ref_count` increment are committed in the same D1 batch, so GC can
+mark a NAR for deletion only while it is ready and the counter is zero.
 
 The supported upload order is therefore:
 
@@ -100,7 +111,7 @@ The supported upload order is therefore:
 2. Upload the corresponding `.narinfo`.
 3. Optionally register the resulting narinfo objects into a package version.
 
-This strict mode avoids serving metadata for an unavailable payload. The implementation must preserve this invariant even when uploads are retried, finalized through the direct-upload flow, or completed through internal multipart upload.
+This strict mode avoids serving metadata for an unavailable payload. The implementation must preserve this invariant even when uploads are retried or finalized through the direct-upload flow.
 
 ## Authentication
 
@@ -119,8 +130,9 @@ only over HTTPS:
 machine nix-cache.example.com login nix password <write-token>
 ```
 
-Bearer authentication remains the canonical API format. The Basic form exists
-only because `nix copy --to` does not provide a custom Bearer header option.
+Bearer authentication remains the canonical API format. The Basic form remains
+useful for Nix clients that read from a token-protected cache and do not provide
+a custom Bearer header option.
 
 The three tokens have separate roles:
 
@@ -140,6 +152,8 @@ ADMIN_TOKEN
 ```
 
 Tokens must never be stored in source code, D1, URLs, cookies, browser persistent storage beyond the current tab session, or application logs. The web console stores a validated admin token only in same-origin `sessionStorage`, so a refresh in the same browser tab does not require another login. The token is cleared when the tab's page session ends and is never stored in `localStorage`.
+The Worker hashes supplied and configured tokens to a fixed size and compares
+them with Cloudflare Workers' `crypto.subtle.timingSafeEqual()` primitive.
 
 R2 buckets and D1 databases are Worker bindings and must be configured with Wrangler or the Cloudflare Dashboard. The application web console manages runtime policy and package/version metadata; it cannot rewrite Worker bindings or Worker Secrets.
 
@@ -235,8 +249,6 @@ GET    /api/admin/policies
 POST   /api/admin/policies
 PUT    /api/admin/policies/{policyId}
 DELETE /api/admin/policies/{policyId}
-GET    /api/admin/settings
-PUT    /api/admin/settings
 ```
 
 Version deletion returns `202 Accepted` with a persistent job ID. The console
@@ -291,13 +303,15 @@ protection remains effective even if it leaves a group above capacity. Existing
 policy rows are cleared by the structured-rule migration and must be recreated
 in the new editor.
 
-The default GC retention is 7 days. In addition to structured policies,
-the Worker protects the newest 3 versions for every exact package-name and
-complete-tag combination. A Workers Cron trigger runs GC every eight hours.
-Objects that are not registered to an active version use the existing six-hour
-HTTP cache TTL.
+The default GC retention is `DEFAULT_RETENTION_DAYS` (7 days in the template).
+In addition to structured policies, the Worker protects the newest 3 versions
+for every exact package-name and complete-tag combination. A Workers Cron
+trigger runs GC every eight hours. Retention is used only by GC and never
+changes HTTP cache headers.
 
-The default retention can be changed from the management console. Cache-info values (`StoreDir`, `Priority`, and `WantMassQuery`) are also stored in D1 when changed and otherwise use Wrangler defaults.
+Cache-info values (`StoreDir`, `Priority`, and `WantMassQuery`) are Wrangler
+variables. There is no settings table or settings API; change deployment
+values with Wrangler and redeploy.
 
 ### Pins and immediate deletion
 
@@ -353,6 +367,7 @@ cp wrangler.jsonc.example wrangler.jsonc
 # Edit wrangler.jsonc and replace every resource placeholder.
 npx wrangler login
 npx wrangler d1 migrations apply <D1_DATABASE_NAME> --remote
+# Configure READ_TOKEN only when Worker-authenticated reads are desired.
 npx wrangler secret put READ_TOKEN
 npx wrangler secret put WRITE_TOKEN
 npx wrangler secret put ADMIN_TOKEN
@@ -373,7 +388,11 @@ The default operational variable is `DEFAULT_RETENTION_DAYS=7`. The baseline
 migration seeds an editable `default-package-tags` rule that keeps the newest
 three versions for each exact package-name and complete-tag combination.
 
-Bindings and secrets are infrastructure configuration. The management console can configure retention, matching policies, tags, pins, and package/version metadata after deployment, but cannot replace the R2 bucket, D1 database, or Worker Secrets.
+Bindings and secrets are infrastructure configuration. The management console
+can configure retention policies, tags, pins, and package/version metadata
+after deployment, but cannot replace the R2 bucket, D1 database, or Worker
+Secrets. A full rebuild clears D1, R2, `_nix_uploads/`, and edge cache before
+applying the single initial migration.
 
 The local test suite uses the Workers Vitest pool with local D1/R2 simulators.
 
@@ -381,7 +400,7 @@ The local test suite uses the Workers Vitest pool with local D1/R2 simulators.
 
 The v1 implementation is complete when it can demonstrate:
 
-- Real `nix copy --to` and `nix copy --from` operation.
+- Real staging direct NAR publishing with `bin/nix-cache-upload` and Nix readback.
 - GET, HEAD, Range, ETag, and conditional request behavior.
 - The complete anonymous/read/write/admin permission matrix.
 - Idempotent same-content PUT and conflict on different-content PUT.

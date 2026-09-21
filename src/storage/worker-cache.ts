@@ -11,10 +11,10 @@ function workerCache(): Cache | null {
   }
 }
 
-export function workerCacheKey(request: Request, generation = "0"): Request {
+export function workerCacheKey(request: Request, variant = ""): Request {
   const url = new URL(request.url);
   url.search = "";
-  url.searchParams.set("__nix_cache_generation", generation);
+  if (variant) url.searchParams.set("__worker_cache_variant", variant);
   return new Request(url.toString(), { method: "GET" });
 }
 
@@ -25,12 +25,12 @@ export function isWorkerCacheEligible(request: Request): boolean {
     && !request.headers.has("If-Match");
 }
 
-export async function matchWorkerCache(request: Request, generation = "0"): Promise<Response | null> {
+export async function matchWorkerCache(request: Request, variant = ""): Promise<Response | null> {
   if (!isWorkerCacheEligible(request)) return null;
   const cache = workerCache();
   if (!cache) return null;
   try {
-    return await cache.match(workerCacheKey(request, generation)) ?? null;
+    return await cache.match(workerCacheKey(request, variant)) ?? null;
   } catch {
     return null;
   }
@@ -41,11 +41,11 @@ export function responseForRequestMethod(response: Response, method: string): Re
   return response;
 }
 
-export function scheduleWorkerCachePut(ctx: WaitUntilContext, request: Request, response: Response, generation = "0"): void {
+export function scheduleWorkerCachePut(ctx: WaitUntilContext, request: Request, response: Response, variant = ""): void {
   if (request.method !== "GET" || response.status !== 200 || !isWorkerCacheEligible(request)) return;
   const cache = workerCache();
   if (!cache) return;
-  const key = workerCacheKey(request, generation);
+  const key = workerCacheKey(request, variant);
   ctx.waitUntil(cache.put(key, response.clone()).catch(() => undefined));
 }
 

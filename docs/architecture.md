@@ -1,114 +1,106 @@
 # Architecture
 
-## Request path
+Nix Cache Worker is deliberately split into a cheap read plane and an
+authenticated management plane. R2 is authoritative for bytes; D1 is an
+index and lifecycle control plane. Public object reads never query D1.
 
-The Worker routes `/nix-cache-info`, narinfo paths, `/nar/*` paths, and the
-direct-upload control API through Hono. Authentication is applied before
-mutation routes. Public GET and HEAD requests query R2 for object bytes and D1
-for metadata-driven headers. Normal PUT requests validate the path, enforce
-immutable semantics, and index the result. Large direct uploads send the file
-to R2 outside the Worker and use the Worker only for verification and final
-indexing.
+## Request paths
 
 ```text
-Nix client
-   |
-   v
-Hono route + auth + request ID
-   |------------------------------|
-   v                              v
-R2 object bytes              D1 object index
-   |                              |
-   +---- dynamic TTL / version membership
+Anonymous Nix read (READ_TOKEN empty)
+  ├─ R2 Custom Domain + CDN ───────────────> R2
+  └─ Worker ──307 presigned URL────────────> R2
 
-Large CI NAR
-   |
-   +--> Worker creates session + presigned R2 URL
-   |
-   +--> direct PUT to R2 staging key
-   |
-   +--> Worker verifies, finalizes, and indexes canonical key
+Authenticated Nix read (READ_TOKEN set)
+  Worker ──auth + 307 presigned URL─────────> R2
+
+CI/Admin write
+  Worker ──conditional PUT / D1 batch───────> R2 + D1
 ```
 
-## Storage boundaries
+When `READ_TOKEN` is non-empty, the deployment must not expose an R2 Custom
+Domain for the cache: it would bypass Worker authentication. When it is empty,
+the Custom Domain is optional and is usually the lowest-cost read entry point.
 
-R2 is authoritative for object bytes and supports both the internal multipart
-upload used for normal Worker PUTs and the staging objects used by direct
-uploads. D1 is authoritative for searchable metadata and lifecycle
-state: object indexes, narinfo-to-NAR references, packages, versions, tags,
-policies, pins, jobs, and audit records. A D1 row must never be treated as a replacement
-for an R2 object; narinfo acceptance checks both.
+The Worker validates the cache key and creates a presigned GET/HEAD URL. It
+does not call D1 or R2 `HEAD` before redirecting, and it returns
+`Cache-Control: no-store` on the redirect. R2 supplies the final status,
+ETag, conditional response, range response, and 404. `HEAD + Range` uses a
+binding fallback because some Nix clients need exact `Content-Range` metadata
+before downloading. Worker Cache is used only for the generated
+`/nix-cache-info` response.
 
-Direct upload staging keys use the `_nix_uploads/` prefix and are never served
-by cache routes or indexed as cache objects. A completion request streams the
-staging object through the Worker, recomputes SHA-256, and conditionally creates
-the canonical `/nar/` object before writing its D1 row. Scheduled cleanup
-removes expired and completed staging sessions in bounded batches.
+## Cache objects
 
-## Package/version hierarchy
+NAR and narinfo keys are immutable after a successful conditional R2 PUT.
+They are stored with:
 
-`artifact_packages` is the first-level grouping entity. Each package contains
-many `artifact_versions`, identified by `(package_name, version_name)`. A
-version owns many narinfo members through `artifact_version_members`; each
-narinfo points to its NAR through `narinfo_refs`.
+```text
+Cache-Control: public, max-age=31536000, immutable
+```
 
-Version names are opaque and are never parsed. Re-registering a version replaces
-its complete tags and member declaration while preserving its original
-`registered_at` and every immutable cache object.
+The same metadata is used by promoted staging NAR uploads. The R2 Custom Domain
+should use a Cache Rule covering `/nix-cache-info`, `/*.narinfo`, and `/nar/*`
+with a long edge TTL and cached 404s. `/nix-cache-info` uses a short five-minute
+client cache lifetime because deployment variables can change; the edge rule
+may still keep it warm. Deletion does not bump a generation or invalidate edge
+caches. A CDN, presigned URL, or client may therefore return a stale object
+after deletion; this is intentional best-effort behavior.
 
-The version membership query also associates each member's referenced NAR with
-the version. This lets both the narinfo and NAR receive the same effective
-response TTL, while shared NAR payloads remain protected by live references.
-Deletion transitions are persisted before a job is returned, while a
-multi-batch registration holds its version in `registering`. Deletion only
-claims active versions, and object deletion applies a live-reference guard at
-the state transition; deleting object keys cannot be reused until cleanup
-completes.
+`/nix-cache-info` is generated from Wrangler variables by the Worker. For an
+R2 Custom Domain, deployment writes the same bytes to the `nix-cache-info` R2
+object. It is not stored in D1 and is not part of retention or GC. The Worker
+Cache key includes the three public cache-info values, so a configuration change
+uses a new key without reintroducing a D1 generation lookup.
 
-## Retention and jobs
+## Uploads
 
-Retention is evaluated for each version. A structured rule ANDs conditions on
-package name, version name, all tags, or an individual tag value. Its `lastN`
-count protects the newest matching versions independently in each computed
-`groupBy` tuple. Overlapping rules union their protection, and the largest
-matching finite duration applies unless the version has an explicit override.
-An optional `capacityVersions` action is enforced independently for each
-matching policy/group; versions ranked beyond the limit may be deleted before
-their age-based retention expires. Pin and keep-latest protection remains
-fail-safe when protected versions exceed capacity.
-`registered_at` orders versions, not parsed version labels. GC and deletion use
-persistent jobs and bounded batches so a Worker interruption can be retried
-safely.
+NAR payloads use the stateful direct-upload flow:
 
-The default finite retention is seven days. The baseline migration seeds an
-ordinary editable rule that protects the newest three versions in each exact
-`(package_name, complete tags)` group; it can be changed or deleted from the
-admin console.
+1. `POST /api/uploads` validates the final key, size, and SHA-256, creates an
+   `upload_sessions` row, and returns an `uploadId` plus a presigned PUT for
+   `_nix_uploads/<uploadId>`.
+2. CI uploads the bytes directly to that random staging key with
+   `If-None-Match: *`.
+3. `POST /api/uploads/<uploadId>/complete` reads and hashes the staging object,
+   checks the final key, then conditionally streams the staging bytes to the
+   immutable final NAR key and indexes it in D1.
+4. Completed, failed, expired, and revoked sessions retain their staging object
+   until the session expiry and are then cleaned up by bounded cron work.
 
-HTTP TTL is separate from deletion authority. Unclassified objects use six
-hours. Version-associated objects use the longest active-version retention. Pin
-and keep-latest protect automatic GC only and do not change the HTTP TTL.
+Staging keys are never exposed by cache reads and never appear in `objects`.
+A same-content completion retry is idempotent; different final content is an
+immutable conflict. A wrong staging digest never creates a final object.
+Final-key key reuse is allowed after the R2 object and D1 row have been removed.
 
-Full public GET responses use `caches.default` with a D1-backed cache
-generation in the key. Version, rule, setting, and deletion updates advance
-the generation so stale dynamic TTLs or deleted objects are not served from a
-previous Worker cache entry. Range and conditional requests bypass the Worker
-cache and retain the R2-backed protocol path.
+NAR `PUT /nar/*` is deliberately rejected with `405 direct_upload_required`.
+Narinfo PUT remains a Worker operation because it must parse the referenced NAR
+and atomically maintain `narinfo_refs` and `narinfo_ref_count`.
+The bundled `bin/nix-cache-upload` client is the supported publisher.
 
-## Admin surface
+## D1 lifecycle model
 
-`/admin` is a static HTML console rendered as a single main-column view. After
-successful validation, its token is kept in same-origin `sessionStorage` for
-the current browser tab and sent as an Authorization header. A page reload
-restores and validates the token before showing the console; an invalid token
-is removed. The main view renders package rows, optional tag-group rows, and
-expandable version and read-only file rows. Tag grouping is a client-side
-layout toggle and does not change the package/version API data. `/api/admin/overview`
-distinguishes package/version counts from direct cache-object counts so a valid
-cache with unregistered objects is visible to operators.
+The single migration creates `objects`, `narinfo_refs`, package/version
+membership, retention policies, jobs, `job_object_items`, GC snapshots, and
+audit metadata. `objects` stores both `narinfo_ref_count` and
+`version_member_count`, so GC does not need a per-object `COUNT(*)` scan.
 
-## Observability
+Membership changes and counter changes use the same D1 batch. A NAR can enter
+the deletion state only while it is ready and `narinfo_ref_count = 0`. The
+deletion job obtains the same short-lived write claim used by upload completion,
+revokes issued upload sessions for the key, deletes R2, and then deletes the D1
+object row. There is no tombstone and the final key may be reused after
+cleanup. If a job is interrupted, the deleting row and job item remain
+retryable.
 
-The Worker emits structured logs for cache hits/misses, R2 reads/writes,
-served/uploaded bytes, and authentication failures. It does not run a
-Prometheus server or expose credentials in logs.
+Versions are identified by `(package_name, version_name)`; names are opaque.
+Retention and pinning are used only by GC and never affect HTTP response TTLs.
+`DEFAULT_RETENTION_DAYS` is a Worker variable rather than a D1 setting.
+
+## Admin and observability
+
+The admin console manages versions, policies, pins, and GC. Deployment values
+are changed with Wrangler and redeployed; there is no settings table or
+settings API. Worker logs emit safe structured `cache_hit`, `cache_miss`,
+`r2_get`, `r2_put`, `bytes_served`, `upload_bytes`, and `auth_failure` events.
+Tokens and raw authorization headers are never logged.

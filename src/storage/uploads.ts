@@ -15,12 +15,13 @@ import {
 import { createPresignedPut, directUploadTtl } from "./presign";
 
 export const DIRECT_UPLOAD_STAGING_PREFIX = "_nix_uploads/";
+export const MAX_DIRECT_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 
 function emitDirectR2Get(key: string, operation: "head" | "get", object: R2Object | R2ObjectBody | null): void {
   emitMetric("r2_get", { key, kind: "nar", operation, status: object ? 200 : 404, bytes: object?.size ?? 0, directUpload: true });
 }
 
-export type UploadSessionStatus = "issued" | "completed" | "failed" | "expired";
+export type UploadSessionStatus = "issued" | "completed" | "failed" | "expired" | "revoked";
 
 export type UploadSessionRow = {
   id: string;
@@ -71,6 +72,9 @@ export function validateDirectUploadInput(body: unknown): { key: string; size: n
   assertSupportedNarKey(key);
   if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
     throw new AppError("invalid_upload_size", "The direct-upload size must be a non-negative safe integer", 422);
+  }
+  if (size > MAX_DIRECT_UPLOAD_BYTES) {
+    throw new AppError("invalid_upload_size", "The direct-upload size must not exceed the 5 GiB R2 single-PUT limit", 422);
   }
   if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256)) {
     throw new AppError("invalid_upload_sha256", "The direct-upload SHA-256 must be 64 lowercase hexadecimal characters", 422);
@@ -198,6 +202,7 @@ export async function completeUploadSession(env: Bindings, id: string): Promise<
   if (!session) throw new AppError("upload_session_not_found", "The direct-upload session was not found", 404);
   if (session.status === "expired") throw new AppError("upload_expired", "The direct-upload session has expired", 410);
   if (session.status === "failed") throw new AppError("upload_failed", "The direct-upload session has failed", 409, { errorCode: session.error_code });
+  if (session.status === "revoked") throw new AppError("upload_revoked", "The direct-upload session was revoked because its final key was deleted", 409);
   if (session.status !== "completed" && Date.parse(session.expires_at) <= Date.now()) {
     await markSessionExpired(env, id);
     throw new AppError("upload_expired", "The direct-upload session has expired", 410);
@@ -274,13 +279,16 @@ export async function completeUploadSession(env: Bindings, id: string): Promise<
     }
     emitMetric("r2_put", { key: session.r2_key, kind: "nar", status: 201, duplicate: false, bytes: incoming.size, directUpload: true });
     emitMetric("upload_bytes", { key: session.r2_key, kind: "nar", status: 201, bytes: incoming.size, directUpload: true });
-    await upsertObject(env, {
+    if (!await upsertObject(env, {
       key: session.r2_key,
       kind: "nar",
       etag: object.httpEtag,
       sha256: incoming.sha256,
       size: object.size,
-    });
+    })) {
+      await env.CACHE_BUCKET.delete(session.r2_key);
+      throw new AppError("object_deleting", "The object is currently being deleted", 409);
+    }
     const completedSession = await markSessionCompleted(env, id, object.httpEtag);
     return { session: completedSession, object, duplicate: false, sha256: incoming.sha256 };
   } finally {
@@ -292,7 +300,7 @@ export async function cleanupUploadSessions(env: Bindings, limit = 100): Promise
   const timestamp = now();
   const rows = await env.DB.prepare(
     `SELECT * FROM upload_sessions
-     WHERE status IN ('completed', 'failed', 'expired')
+     WHERE status IN ('completed', 'failed', 'expired', 'revoked')
         OR (status = 'issued' AND expires_at <= ?)
      ORDER BY updated_at ASC LIMIT ?`,
   ).bind(timestamp, limit).all<UploadSessionRow>();
@@ -315,7 +323,7 @@ export async function cleanupUploadSessions(env: Bindings, limit = 100): Promise
     }
     if (await deleteStagingObject(env, row)) {
       await env.DB.prepare(
-        "DELETE FROM upload_sessions WHERE id = ? AND status IN ('completed', 'failed', 'expired') AND expires_at <= ?",
+        "DELETE FROM upload_sessions WHERE id = ? AND status IN ('completed', 'failed', 'expired', 'revoked') AND expires_at <= ?",
       ).bind(row.id, timestamp).run();
     }
   }

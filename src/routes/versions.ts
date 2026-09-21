@@ -1,9 +1,8 @@
 import { Hono } from "hono";
-import type { AppEnv } from "../env";
+import type { AppEnv, Bindings } from "../env";
 import { AppError } from "../domain/errors";
 import { emitAudit } from "../observability";
-import { bumpCacheGeneration, getVersion, now, parseTags, type VersionRow } from "../storage/db";
-import { claimObjectWrite, releaseObjectWrite } from "../storage/r2";
+import { getVersion, now, parseTags, type VersionRow } from "../storage/db";
 import { requireRole } from "../middleware/auth";
 
 export const versionRoutes = new Hono<AppEnv>();
@@ -96,62 +95,134 @@ versionRoutes.put("/api/packages/:packageName/versions/:versionName", requireRol
   const members = await assertMembers(c.env, body.narinfoKeys);
   const tags = validateTags(body.tags);
   const retentionDays = validateNonNegativeInteger(body.retentionDays, "retention_days");
-  const versionLockKey = `version-lock/${packageName}/${versionName}`;
-  const versionOwner = await claimObjectWrite(c.env, versionLockKey);
-  if (!versionOwner) throw new AppError("version_update_in_progress", "Another registration for this version is in progress", 409);
-  try {
-    const timestamp = now();
-    const existing = await getVersion(c.env, packageName, versionName);
-    if (existing?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
-    const requestedVersionId = existing?.version_id ?? crypto.randomUUID();
-    const registeredAt = timestamp;
-
-    await c.env.DB.prepare(
+  const timestamp = now();
+  const existing = await getVersion(c.env, packageName, versionName);
+  if (existing?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+  const requestedVersionId = existing?.version_id ?? crypto.randomUUID();
+  const registeredAt = timestamp;
+  const registrationToken = crypto.randomUUID();
+  const lockResult = await c.env.DB.batch([
+    c.env.DB.prepare(
       `INSERT INTO artifact_packages (package_name, created_at, updated_at) VALUES (?, ?, ?)
        ON CONFLICT(package_name) DO UPDATE SET updated_at = excluded.updated_at`,
-    ).bind(packageName, timestamp, timestamp).run();
-    const lockResult = await c.env.DB.prepare(
-      `INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, retention_days, pinned, registered_at, updated_at, state)
-       VALUES (?, ?, ?, ?, ?, COALESCE((SELECT pinned FROM artifact_versions WHERE version_id = ?), 0), ?, ?, 'registering')
+    ).bind(packageName, timestamp, timestamp),
+    c.env.DB.prepare(
+      `INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, retention_days, pinned, registered_at, updated_at, state, registration_token)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'registering', ?)
        ON CONFLICT(package_name, version_name) DO UPDATE SET tags_json = excluded.tags_json,
          retention_days = excluded.retention_days, registered_at = excluded.registered_at,
-         updated_at = excluded.updated_at,
-         state = 'registering'
+         updated_at = excluded.updated_at, state = 'registering', registration_token = excluded.registration_token
        WHERE artifact_versions.state != 'deleting'`,
-    ).bind(requestedVersionId, packageName, versionName, JSON.stringify(tags), retentionDays, requestedVersionId, registeredAt, timestamp).run();
-    if (lockResult.meta.changes !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
-    const locked = await getVersion(c.env, packageName, versionName);
-    if (!locked || locked.state !== "registering") throw new AppError("version_deleting", "The version is currently being deleted", 409);
-    const versionId = locked.version_id;
+    ).bind(requestedVersionId, packageName, versionName, JSON.stringify(tags), retentionDays, existing?.pinned ?? 0, registeredAt, timestamp, registrationToken),
+  ]);
+  if ((lockResult[1]?.meta.changes ?? 0) !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
+  const locked = await getVersion(c.env, packageName, versionName);
+  if (!locked || locked.state !== "registering" || locked.registration_token !== registrationToken) {
+    throw new AppError("version_registration_superseded", "The version registration was superseded by another request", 409);
+  }
+  const versionId = locked.version_id;
 
-    await c.env.DB.prepare("DELETE FROM artifact_version_members WHERE version_id = ?").bind(versionId).run();
-    for (let offset = 0; offset < members.length; offset += 100) {
-      const statements = members.slice(offset, offset + 100).map((key) => c.env.DB.prepare(
-        `INSERT INTO artifact_version_members (version_id, narinfo_key)
-         SELECT ?, ?
-         WHERE EXISTS (
-           SELECT 1
-           FROM objects ni
+  try {
+
+    await c.env.DB.prepare(
+    `DELETE FROM artifact_version_pending_members
+     WHERE version_id = ? AND registration_token != ? AND EXISTS (
+       SELECT 1 FROM artifact_versions WHERE version_id = ? AND state = 'registering' AND registration_token = ?
+     )`,
+  ).bind(versionId, registrationToken, versionId, registrationToken).run();
+    await c.env.DB.prepare(
+      `DELETE FROM artifact_version_pending_members
+       WHERE version_id = ? AND registration_token = ?`,
+    ).bind(versionId, registrationToken).run();
+
+  // Pending members carry an operation token. A concurrent registration can
+  // supersede this request, but cannot interleave with its final membership
+  // replacement or alter denormalized counters.
+  for (let offset = 0; offset < members.length; offset += 50) {
+    const statements = [];
+    for (const key of members.slice(offset, offset + 50)) {
+      statements.push(c.env.DB.prepare(
+        `INSERT OR IGNORE INTO artifact_version_pending_members (version_id, registration_token, narinfo_key)
+         SELECT ?, ?, ? WHERE EXISTS (
+           SELECT 1 FROM artifact_versions
+           WHERE version_id = ? AND state = 'registering' AND registration_token = ?
+         ) AND EXISTS (
+           SELECT 1 FROM objects ni
            JOIN narinfo_refs r ON r.narinfo_key = ni.r2_key
            JOIN objects n ON n.r2_key = r.nar_key
            WHERE ni.r2_key = ? AND ni.kind = 'narinfo' AND ni.state = 'ready'
              AND n.kind = 'nar' AND n.state = 'ready'
          )`,
-      ).bind(versionId, key, key));
-      await c.env.DB.batch(statements);
+      ).bind(versionId, registrationToken, key, versionId, registrationToken, key));
     }
-    const memberCount = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM artifact_version_members WHERE version_id = ?")
-      .bind(versionId).first<{ count: number }>();
-    if (Number(memberCount?.count ?? 0) !== members.length) {
-      throw new AppError("missing_narinfo", "One or more narinfo dependencies changed while registering the version", 424);
-    }
-    const activated = await c.env.DB.prepare("UPDATE artifact_versions SET state = 'active', updated_at = ? WHERE version_id = ? AND state = 'registering'")
-      .bind(timestamp, versionId).run();
-    if (activated.meta.changes !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
-    await bumpCacheGeneration(c.env);
+    await c.env.DB.batch(statements);
+  }
+  const memberCount = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM artifact_version_pending_members WHERE version_id = ? AND registration_token = ?",
+  ).bind(versionId, registrationToken).first<{ count: number }>();
+  const current = await c.env.DB.prepare("SELECT state, registration_token FROM artifact_versions WHERE version_id = ?")
+    .bind(versionId).first<{ state: string; registration_token: string | null }>();
+  if (!current || current.state !== "registering" || current.registration_token !== registrationToken) {
+    throw new AppError("version_registration_superseded", "The version registration was superseded by another request", 409);
+  }
+  if (Number(memberCount?.count ?? 0) !== members.length) {
+    throw new AppError("missing_narinfo", "One or more narinfo dependencies changed while registering the version", 424);
+  }
+
+  let finalized: Awaited<ReturnType<Bindings["DB"]["batch"]>>;
+  try {
+    finalized = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE objects SET version_member_count = MAX(0, version_member_count - (
+         SELECT COUNT(*) FROM artifact_version_members m WHERE m.version_id = ? AND m.narinfo_key = objects.r2_key
+       )) WHERE kind = 'narinfo' AND r2_key IN (SELECT narinfo_key FROM artifact_version_members WHERE version_id = ?)
+         AND EXISTS (SELECT 1 FROM artifact_versions WHERE version_id = ? AND state = 'registering' AND registration_token = ?)`,
+    ).bind(versionId, versionId, versionId, registrationToken),
+    c.env.DB.prepare(
+      `DELETE FROM artifact_version_members WHERE version_id = ?
+       AND EXISTS (SELECT 1 FROM artifact_versions WHERE version_id = ? AND state = 'registering' AND registration_token = ?)`,
+    ).bind(versionId, versionId, registrationToken),
+    c.env.DB.prepare(
+      `INSERT INTO artifact_version_members (version_id, narinfo_key)
+       SELECT ?, p.narinfo_key
+       FROM artifact_version_pending_members p
+       JOIN artifact_versions v ON v.version_id = p.version_id
+         AND v.state = 'registering' AND v.registration_token = p.registration_token
+       JOIN narinfo_refs r ON r.narinfo_key = p.narinfo_key
+       JOIN objects ni ON ni.r2_key = p.narinfo_key AND ni.kind = 'narinfo' AND ni.state = 'ready'
+       JOIN objects n ON n.r2_key = r.nar_key AND n.kind = 'nar' AND n.state = 'ready'
+       WHERE p.version_id = ? AND p.registration_token = ?`,
+    ).bind(versionId, versionId, registrationToken),
+    c.env.DB.prepare(
+      `UPDATE artifact_versions
+       SET state = CASE WHEN changes() = ? THEN 'active' ELSE state END,
+           registration_token = CASE WHEN changes() = ? THEN NULL ELSE registration_token END,
+           updated_at = CASE WHEN changes() = ? THEN ? ELSE NULL END
+       WHERE version_id = ? AND state = 'registering' AND registration_token = ?`,
+    ).bind(members.length, members.length, members.length, timestamp, versionId, registrationToken),
+    c.env.DB.prepare(
+      `UPDATE objects SET version_member_count = version_member_count + 1
+       WHERE kind = 'narinfo' AND r2_key IN (SELECT narinfo_key FROM artifact_version_members WHERE version_id = ?)
+         AND EXISTS (SELECT 1 FROM artifact_versions WHERE version_id = ? AND state = 'active' AND registration_token IS NULL AND updated_at = ?)`,
+    ).bind(versionId, versionId, timestamp),
+    c.env.DB.prepare("DELETE FROM artifact_version_pending_members WHERE version_id = ? AND registration_token = ?").bind(versionId, registrationToken),
+    ]);
+  } catch {
+    // The final state update deliberately violates the existing updated_at
+    // NOT NULL constraint when the preceding membership INSERT did not add
+    // the complete member set. D1 batches are transactional, so this rolls
+    // back the replacement and preserves the previous live membership.
+    throw new AppError("version_registration_failed", "The version dependencies changed before registration completed", 409);
+  }
+  if ((finalized[3]?.meta.changes ?? 0) !== 1) {
+    throw new AppError("version_registration_failed", "The version dependencies changed before registration completed", 409);
+  }
     await emitAudit(c.env, existing ? "version_update" : "version_create", c.get("role"), `${packageName}/${versionName}`, { versionId, members: members.length, tags });
     return c.json({ versionId, packageName, versionName, tags, narinfoKeys: members, retentionDays, pinned: Boolean(locked.pinned), registeredAt }, existing ? 200 : 201);
-  } finally {
-    await releaseObjectWrite(c.env, versionLockKey, versionOwner);
+  } catch (error) {
+    await c.env.DB.prepare(
+      "DELETE FROM artifact_version_pending_members WHERE version_id = ? AND registration_token = ?",
+    ).bind(versionId, registrationToken).run();
+    throw error;
   }
 });

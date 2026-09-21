@@ -8,9 +8,10 @@ that build packages and publish them to a private, policy-managed cache.
 
 It supports:
 
-- standard `nix copy --to` and `nix copy --from` workflows;
-- public cache reads with authenticated writes;
-- direct-to-R2 single-PUT uploads for NARs larger than the Worker request limit;
+- standard Nix cache reads and authenticated narinfo publishing; NAR payloads use the direct-upload client;
+- optional anonymous or read-token-protected cache reads with authenticated writes;
+- a zero-compile Nix publishing client with direct-to-R2 NAR uploads;
+- low-cost R2 Custom Domain reads or presigned R2 redirects through the Worker;
 - package and build-version organization with tags;
 - retention policies, pins, and bounded garbage collection;
 - an authenticated web console for operations and administration.
@@ -32,6 +33,7 @@ schema, configure Worker Secrets, and deploy:
 ```bash
 npx wrangler login
 npx wrangler d1 migrations apply <D1_DATABASE_NAME> --remote
+# Optional: configure this only when Worker-authenticated reads are required.
 npx wrangler secret put READ_TOKEN
 npx wrangler secret put WRITE_TOKEN
 npx wrangler secret put ADMIN_TOKEN
@@ -53,11 +55,31 @@ for the deployed origin.
 The admin console is available at `/admin`. It manages package versions,
 retention rules, pins, garbage collection, and persistent deletion jobs.
 
-For NARs larger than the Worker request-body limit, use the authenticated
-direct-upload API documented in [`docs/configuration.md`](docs/configuration.md).
-The client uploads the file directly to an R2 presigned URL, then asks the
-Worker to verify and finalize it. This is a CI upload path; it does not change
-the standard `nix copy --to` protocol.
+For CI publishing, use [`bin/nix-cache-upload`](bin/nix-cache-upload). It
+exports a standard local Nix file cache, sends every NAR to a random staging
+R2 key through an authenticated presigned URL, asks the Worker to verify and
+promote it, publishes narinfo only after completion, and registers the requested
+package/version. NAR payloads are intentionally not accepted through ordinary
+`nix copy --to` PUT requests.
+
+```bash
+NIX_CACHE_WRITE_TOKEN=... bin/nix-cache-upload \
+  --to https://cache.example.org \
+  --package example --version ci-123 --tag channel=main \
+  nixpkgs#hello
+```
+
+When `READ_TOKEN` is empty, deployments may use either an R2 Custom Domain or
+the Worker redirect path for anonymous reads. When `READ_TOKEN` is non-empty,
+all cache reads must enter through the Worker and a public R2 Custom Domain
+must not be enabled. The Worker validates the key, performs no D1 lookup or
+R2 `HEAD`, and returns a `307` presigned R2 URL; R2 supplies the final status,
+Range, ETag, and conditional response. Redirects are `no-store`.
+
+NAR and narinfo objects use `public, max-age=31536000, immutable`. Deletion is
+best effort for CDN, browser, and presigned-URL caches, so stale content after
+deletion is accepted. See [`docs/architecture.md`](docs/architecture.md) and
+RFC-0022 for the full staging-upload design.
 
 ## Development
 
@@ -86,6 +108,7 @@ npm run build
   secrets, custom domains, and verification.
 - [Configuration and operations](docs/configuration.md)
 - [Architecture](docs/architecture.md)
+- [Remote integration tests](docs/integration-tests.md)
 - [RFC history](docs/rfc/README.md)
 
 R2 is the source of truth for cache bytes, D1 stores indexes and lifecycle
