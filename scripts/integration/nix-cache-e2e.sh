@@ -205,6 +205,17 @@ done < <(find "$expected_file_cache" -maxdepth 1 -type f -name '*.narinfo' -prin
 sort -u "$cleanup_keys_file" > "$cleanup_keys_file.sorted"
 mv "$cleanup_keys_file.sorted" "$cleanup_keys_file"
 
+narinfo_key_for_store_path() {
+  local store_path="$1" expected_narinfo_file
+  while IFS= read -r expected_narinfo_file; do
+    if grep -F -x -q "StorePath: $store_path" "$expected_narinfo_file"; then
+      basename "$expected_narinfo_file"
+      return 0
+    fi
+  done < <(find "$expected_file_cache" -maxdepth 1 -type f -name '*.narinfo' -print | sort)
+  return 1
+}
+
 client_output="$temporary_directory/nix-cache-upload.log"
 printf 'Publishing the small and over-100 MiB paths with nix-cache-upload...\n'
 NIX_CACHE_WRITE_TOKEN="$NIX_CACHE_TESTING_WRITE_TOKEN" \
@@ -221,27 +232,10 @@ if [[ "$largest_client_nar_size" -le $((100 * 1024 * 1024)) ]]; then
   exit 1
 fi
 
-small_narinfo_key="$(basename "$small_store_path").narinfo"
-if ! aws s3api head-object \
-  --bucket nix-cache-testing \
-  --key "$small_narinfo_key" \
-  --endpoint-url "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com" \
-  >/dev/null; then
-  printf 'The direct R2 HEAD could not find the published small narinfo: %s\n' "$small_narinfo_key" >&2
-  printf 'Matching R2 keys:\n' >&2
-  aws s3api list-objects-v2 \
-    --bucket nix-cache-testing \
-    --prefix "${small_narinfo_key%%.narinfo}" \
-    --endpoint-url "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com" \
-    --query 'Contents[].Key' --output text >&2 || true
-  printf 'Matching D1 rows:\n' >&2
-  npx wrangler d1 execute nix-cache-testing --remote --config wrangler.integration.generated.jsonc \
-    --command "SELECT r2_key, kind, state, etag, size FROM objects WHERE r2_key = '$small_narinfo_key';" >&2 || true
-  printf 'D1 cache state:\n' >&2
-  npx wrangler d1 execute nix-cache-testing --remote --config wrangler.integration.generated.jsonc \
-    --command "SELECT kind, state, COUNT(*) AS count FROM objects GROUP BY kind, state; SELECT COUNT(*) AS refs FROM narinfo_refs; SELECT COUNT(*) AS members FROM artifact_version_members; SELECT package_name, version_name, state FROM artifact_versions WHERE package_name = '$test_package' AND version_name = '$test_version'; SELECT id, type, status FROM jobs;" >&2 || true
+small_narinfo_key="$(narinfo_key_for_store_path "$small_store_path")" || {
+  printf 'Could not find the generated small narinfo key\n' >&2
   exit 1
-fi
+}
 small_nar_key="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/$small_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
 if [[ -z "$small_nar_key" ]]; then
   printf 'The direct small NAR upload did not publish a usable narinfo\n' >&2
@@ -258,7 +252,10 @@ if [[ "$small_downloaded_sha256" != "$small_expected_sha256" ]]; then
   exit 1
 fi
 
-large_narinfo_key="$(basename "$large_store_path").narinfo"
+large_narinfo_key="$(narinfo_key_for_store_path "$large_store_path")" || {
+  printf 'Could not find the generated large narinfo key\n' >&2
+  exit 1
+}
 large_nar_key="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/$large_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
 if [[ -z "$large_nar_key" ]]; then
   printf 'nix-cache-upload did not publish the large narinfo\n' >&2
