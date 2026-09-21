@@ -192,14 +192,27 @@ export async function putImmutableObject(
     }
 
     if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
-    const [hashBody, uploadBody] = request.body.tee();
-    const hashPromise = hashStream(hashBody);
     const onlyIf: R2Conditional = { etagDoesNotMatch: "*" };
-    const object = await env.CACHE_BUCKET.put(key, uploadBody, {
-      onlyIf,
-      httpMetadata: httpMetadataFor(kind),
-    });
-    const incoming = await hashPromise;
+    let object: R2Object | null;
+    let incoming: { sha256: string; size: number };
+    if (kind === "narinfo") {
+      // Narinfo files are small. Buffering them avoids coupling an incoming
+      // Worker request stream to the R2 binding's conditional write lifetime.
+      const body = await request.arrayBuffer();
+      incoming = await hashStream(new Response(body).body);
+      object = await env.CACHE_BUCKET.put(key, body, {
+        onlyIf,
+        httpMetadata: httpMetadataFor(kind),
+      });
+    } else {
+      const [hashBody, uploadBody] = request.body.tee();
+      const hashPromise = hashStream(hashBody);
+      object = await env.CACHE_BUCKET.put(key, uploadBody, {
+        onlyIf,
+        httpMetadata: httpMetadataFor(kind),
+      });
+      incoming = await hashPromise;
+    }
     if (object) {
       if (indexed?.state === "ready" && (
         !indexed.sha256 || indexed.size !== incoming.size || indexed.sha256 !== incoming.sha256
