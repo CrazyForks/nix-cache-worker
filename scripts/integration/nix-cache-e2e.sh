@@ -215,7 +215,7 @@ NIX_CACHE_WRITE_TOKEN="$NIX_CACHE_TESTING_WRITE_TOKEN" \
     --tag integration=real-nix \
     "$small_store_path" "$large_store_path" | tee "$client_output"
 
-largest_client_nar_size="$(awk -F'[()]' '/^Preparing direct upload for / { value = $2; sub(/ bytes$/, "", value); if (value > largest) largest = value } END { print largest + 0 }' "$client_output")"
+largest_client_nar_size="$(awk -F'[()]' '/^Preparing direct upload for / { value = $2; sub(/ bytes$/, "", value); if ((value + 0) > (largest + 0)) largest = value } END { print largest + 0 }' "$client_output")"
 if [[ "$largest_client_nar_size" -le $((100 * 1024 * 1024)) ]]; then
   printf 'nix-cache-upload did not produce an over-100 MiB direct NAR\n' >&2
   exit 1
