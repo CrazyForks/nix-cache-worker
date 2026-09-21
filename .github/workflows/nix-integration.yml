@@ -65,6 +65,15 @@ jobs:
             R2_S3_ACCESS_KEY_ID R2_S3_SECRET_ACCESS_KEY \
             AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
             value="$(printf '%s' "${!variable_name:-}" | tr -d '\r\n')"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            if [[ "$variable_name" == CLOUDFLARE_API_TOKEN && "$value" == Bearer\ * ]]; then
+              value="${value#Bearer }"
+            fi
+            if [[ "$variable_name" == CLOUDFLARE_API_TOKEN && "$value" == \"*\" ]]; then
+              value="${value#\"}"
+              value="${value%\"}"
+            fi
             printf '%s=%s\n' "$variable_name" "$value" >> "$GITHUB_ENV"
           done
 
