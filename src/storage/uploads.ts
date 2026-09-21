@@ -309,34 +309,46 @@ export async function completeUploadSession(env: Bindings, id: string): Promise<
   const stagedBody = await env.CACHE_BUCKET.get(session.staging_key);
   emitDirectR2Get(session.staging_key, "get", stagedBody);
   if (!stagedBody?.body) throw new AppError("upload_not_ready", "The direct-upload object could not be read from R2", 503);
-  const incoming = await hashStream(stagedBody.body);
-  if (incoming.size !== session.expected_size) {
-    await markSessionFailed(env, id, "upload_size_mismatch");
-    throw uploadMismatch("upload_size_mismatch", "The uploaded object size does not match the declared size");
-  }
-  if (incoming.sha256 !== session.expected_sha256) {
-    await markSessionFailed(env, id, "upload_digest_mismatch");
-    throw uploadMismatch("upload_digest_mismatch", "The uploaded object SHA-256 does not match the declared digest");
-  }
-
   const existing = await env.CACHE_BUCKET.head(session.r2_key);
   emitDirectR2Get(session.r2_key, "head", existing);
   const indexed = await getObject(env, session.r2_key);
   if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
-  if (existing) return await compareOrRepairExisting(env, session, incoming, existing, indexed);
+  if (existing) {
+    const incoming = await hashStream(stagedBody.body);
+    if (incoming.size !== session.expected_size) {
+      await markSessionFailed(env, id, "upload_size_mismatch");
+      throw uploadMismatch("upload_size_mismatch", "The uploaded object size does not match the declared size");
+    }
+    if (incoming.sha256 !== session.expected_sha256) {
+      await markSessionFailed(env, id, "upload_digest_mismatch");
+      throw uploadMismatch("upload_digest_mismatch", "The uploaded object SHA-256 does not match the declared digest");
+    }
+    return await compareOrRepairExisting(env, session, incoming, existing, indexed);
+  }
 
-  const source = await env.CACHE_BUCKET.get(session.staging_key);
-  emitDirectR2Get(session.staging_key, "get", source);
-  if (!source?.body) throw new AppError("upload_not_ready", "The direct-upload object disappeared before finalization", 503);
-  const object = await env.CACHE_BUCKET.put(session.r2_key, source.body, {
-    onlyIf: { etagDoesNotMatch: "*" },
-    httpMetadata: httpMetadataFor("nar"),
-  });
+  const [hashBody, promoteBody] = stagedBody.body.tee();
+  const [incoming, object] = await Promise.all([
+    hashStream(hashBody),
+    env.CACHE_BUCKET.put(session.r2_key, promoteBody, {
+      onlyIf: { etagDoesNotMatch: "*" },
+      httpMetadata: httpMetadataFor("nar"),
+    }),
+  ]);
   if (!object) {
     const raced = await env.CACHE_BUCKET.head(session.r2_key);
     emitDirectR2Get(session.r2_key, "head", raced);
     if (!raced) throw new AppError("upload_race", "The conditional finalization failed without an observable object", 503);
     return await compareOrRepairExisting(env, session, incoming, raced, await getObject(env, session.r2_key));
+  }
+  if (incoming.size !== session.expected_size) {
+    await env.CACHE_BUCKET.delete(session.r2_key);
+    await markSessionFailed(env, id, "upload_size_mismatch");
+    throw uploadMismatch("upload_size_mismatch", "The uploaded object size does not match the declared size");
+  }
+  if (incoming.sha256 !== session.expected_sha256) {
+    await env.CACHE_BUCKET.delete(session.r2_key);
+    await markSessionFailed(env, id, "upload_digest_mismatch");
+    throw uploadMismatch("upload_digest_mismatch", "The uploaded object SHA-256 does not match the declared digest");
   }
   emitMetric("r2_put", { key: session.r2_key, kind: "nar", status: 201, duplicate: false, bytes: incoming.size, directUpload: true });
   emitMetric("upload_bytes", { key: session.r2_key, kind: "nar", status: 201, bytes: incoming.size, directUpload: true });
