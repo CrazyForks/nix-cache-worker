@@ -234,9 +234,9 @@ export async function completeUploadSession(env: Bindings, id: string): Promise<
   }
 
   let owner: string | null = null;
-  for (let attempt = 0; attempt < 4 && !owner; attempt += 1) {
+  for (let attempt = 0; attempt < 8 && !owner; attempt += 1) {
     owner = await claimObjectWrite(env, session.r2_key);
-    if (!owner && attempt < 3) await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt));
+    if (!owner && attempt < 7) await new Promise((resolve) => setTimeout(resolve, Math.min(2_000, 100 * 2 ** attempt)));
   }
   if (!owner) {
     const claim = await env.DB.prepare(
