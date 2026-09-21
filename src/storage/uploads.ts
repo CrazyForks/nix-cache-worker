@@ -238,7 +238,14 @@ export async function completeUploadSession(env: Bindings, id: string): Promise<
     owner = await claimObjectWrite(env, session.r2_key);
     if (!owner && attempt < 3) await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt));
   }
-  if (!owner) throw new AppError("upload_in_progress", "Another upload for this object is in progress", 409);
+  if (!owner) {
+    const claim = await env.DB.prepare(
+      "SELECT expires_at FROM write_claims WHERE r2_key = ?",
+    ).bind(session.r2_key).first<{ expires_at: string }>();
+    throw new AppError("upload_in_progress", "Another upload for this object is in progress", 409, {
+      claimExpiresAt: claim?.expires_at ?? null,
+    });
+  }
   try {
     if (session.status === "completed") {
       const object = await env.CACHE_BUCKET.head(session.r2_key);

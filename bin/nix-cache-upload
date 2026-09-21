@@ -206,7 +206,7 @@ complete_upload() {
     fi
     error_summary="$(jq --raw-output '
       if type == "object" and (.error | type) == "object" then
-        [(.error.code // empty), (.error.message // empty), (.error.details.errorCode // empty)]
+        [(.error.code // empty), (.error.message // empty), (.error.details.errorCode // empty), (.error.details.claimExpiresAt // empty)]
         | map(select(type == "string" and length > 0))
         | unique
         | join(": ")
