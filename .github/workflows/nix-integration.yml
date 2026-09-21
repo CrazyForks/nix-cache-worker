@@ -54,6 +54,20 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command
 
+      - name: Normalize integration secret values
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable_name in \
+            CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN NIX_CACHE_TESTING_URL \
+            NIX_CACHE_TESTING_READ_TOKEN NIX_CACHE_TESTING_WRITE_TOKEN \
+            NIX_CACHE_TESTING_ADMIN_TOKEN READ_TOKEN WRITE_TOKEN ADMIN_TOKEN \
+            R2_S3_ACCESS_KEY_ID R2_S3_SECRET_ACCESS_KEY \
+            AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            value="$(printf '%s' "${!variable_name:-}" | tr -d '\r\n')"
+            printf '%s=%s\n' "$variable_name" "$value" >> "$GITHUB_ENV"
+          done
+
       - name: Check required configuration
         run: |
           set -euo pipefail
