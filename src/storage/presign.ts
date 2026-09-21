@@ -135,6 +135,49 @@ export async function createPresignedRead(
   return createPresignedRequest(env, key, method, expiresInSeconds, {}, issuedAt);
 }
 
+/**
+ * Copy an object inside R2 through the S3-compatible CopyObject operation.
+ * This keeps large promotions inside R2 instead of streaming the bytes through
+ * the Worker request that validates the staging object.
+ */
+export async function copyR2Object(env: Bindings, sourceKey: string, destinationKey: string, issuedAt = new Date()): Promise<void> {
+  const target = endpoint(env);
+  const host = target.host;
+  const path = canonicalPath(env, destinationKey);
+  const copySource = `/${awsEncode(bucket(env))}/${sourceKey.split("/").map(awsEncode).join("/")}`;
+  const headers: Record<string, string> = {
+    host,
+    "x-amz-copy-source": copySource,
+    "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+    "x-amz-date": timestampParts(issuedAt).long,
+  };
+  const signedHeaderNames = Object.keys(headers).sort();
+  const signedHeaders = signedHeaderNames.join(";");
+  const canonicalHeaders = signedHeaderNames
+    .map((name) => `${name}:${canonicalHeaderValue(headers[name] ?? "")}`)
+    .join("\n") + "\n";
+  const canonicalRequest = ["PUT", path, "", canonicalHeaders, signedHeaders, "UNSIGNED-PAYLOAD"].join("\n");
+  const canonicalRequestHash = await sha256(canonicalRequest);
+  const { short, long } = timestampParts(issuedAt);
+  const scope = `${short}/${AWS_REGION}/${AWS_SERVICE}/aws4_request`;
+  const credential = `${accessKeyId(env)}/${scope}`;
+  const dateKey = await hmac(new TextEncoder().encode(`AWS4${secretAccessKey(env)}`), short);
+  const regionKey = await hmac(dateKey, AWS_REGION);
+  const serviceKey = await hmac(regionKey, AWS_SERVICE);
+  const signingKey = await hmac(serviceKey, "aws4_request");
+  const signature = hex(await hmac(signingKey, `AWS4-HMAC-SHA256\n${long}\n${scope}\n${canonicalRequestHash}`));
+  const response = await fetch(`${target.origin}${path}`, {
+    method: "PUT",
+    headers: {
+      ...headers,
+      authorization: `AWS4-HMAC-SHA256 Credential=${credential}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    },
+  });
+  if (!response.ok) {
+    throw new AppError("r2_copy_failed", `R2 could not promote the staging object (HTTP ${response.status})`, 503);
+  }
+}
+
 async function createPresignedRequest(
   env: Bindings,
   key: string,
