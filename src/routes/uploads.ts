@@ -86,7 +86,7 @@ uploadRoutes.post("/api/uploads", requireRole("write"), async (c) => {
       throw new AppError("upload_in_progress", "A different direct upload for this object is already in progress", 409);
     }
     const ttl = Math.max(1, Math.ceil((Date.parse(active.expires_at) - Date.now()) / 1000));
-    const presigned = await createPresignedPut(c.env, active.staging_key, Math.min(ttl, directUploadTtl(c.env)));
+    const presigned = await createPresignedPut(c.env, active.staging_key, Math.min(ttl, directUploadTtl(c.env)), new Date(), active.expected_sha256);
     return c.json(sessionResponse(active, presigned), 200);
   }
 

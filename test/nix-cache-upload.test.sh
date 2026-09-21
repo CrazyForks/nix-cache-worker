@@ -96,7 +96,7 @@ case "$url" in
     if [[ "$count" == "1" ]]; then
       printf '{"error":"retry"}' > "$output"; printf '503'
     else
-      printf '{"uploadId":"00000000-0000-4000-8000-000000000001","key":"nar/test.nar","size":10,"sha256":"%064d","uploadUrl":"https://ffe78ad8ba17aa52f57892f8eda2a903.r2.cloudflarestorage.com/nix-cache-test/_nix_uploads/00000000-0000-4000-8000-000000000001?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=private","uploadHeaders":{"Content-Type":"application/octet-stream","If-None-Match":"*","Cache-Control":"public, max-age=31536000, immutable"}}' "$count" > "$output"
+      printf '{"uploadId":"00000000-0000-4000-8000-000000000001","key":"nar/test.nar","size":10,"sha256":"%064d","uploadUrl":"https://ffe78ad8ba17aa52f57892f8eda2a903.r2.cloudflarestorage.com/nix-cache-test/_nix_uploads/00000000-0000-4000-8000-000000000001?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=private","uploadHeaders":{"Content-Type":"application/octet-stream","If-None-Match":"*","Cache-Control":"public, max-age=31536000, immutable","x-amz-checksum-sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}}' "$count" > "$output"
       printf '201'
     fi
     ;;

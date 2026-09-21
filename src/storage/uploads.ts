@@ -123,7 +123,7 @@ export async function createUploadSession(
   const ttl = directUploadTtl(env);
   const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
   const stagingKey = stagingKeyForSession(id);
-  const presigned = await createPresignedPut(env, stagingKey, ttl, new Date(createdAt));
+  const presigned = await createPresignedPut(env, stagingKey, ttl, new Date(createdAt), input.sha256);
   const result = await env.DB.prepare(
     `INSERT INTO upload_sessions (
        id, r2_key, staging_key, kind, expected_size, expected_sha256, status,
@@ -307,10 +307,20 @@ export async function completeUploadSession(env: Bindings, id: string): Promise<
     throw uploadMismatch("upload_size_mismatch", "The uploaded object size does not match the declared size");
   }
 
-  const stagedBody = await env.CACHE_BUCKET.get(session.staging_key);
-  emitDirectR2Get(session.staging_key, "get", stagedBody);
-  if (!stagedBody?.body) throw new AppError("upload_not_ready", "The direct-upload object could not be read from R2", 503);
-  const incoming = await hashStream(stagedBody.body);
+  const stagedChecksum = staging.checksums.sha256;
+  let incoming: { sha256: string; size: number };
+  if (staging.size >= R2_COPY_PROMOTION_THRESHOLD_BYTES && stagedChecksum) {
+    const bytes = new Uint8Array(stagedChecksum);
+    incoming = {
+      size: staging.size,
+      sha256: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+    };
+  } else {
+    const stagedBody = await env.CACHE_BUCKET.get(session.staging_key);
+    emitDirectR2Get(session.staging_key, "get", stagedBody);
+    if (!stagedBody?.body) throw new AppError("upload_not_ready", "The direct-upload object could not be read from R2", 503);
+    incoming = await hashStream(stagedBody.body);
+  }
   if (incoming.size !== session.expected_size) {
     await markSessionFailed(env, id, "upload_size_mismatch");
     throw uploadMismatch("upload_size_mismatch", "The uploaded object size does not match the declared size");

@@ -51,6 +51,14 @@ function awsEncode(value: string): string {
   return encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
+function base64FromHex(value: string): string {
+  const bytes = new Uint8Array(value.length / 2);
+  for (let index = 0; index < bytes.length; index += 1) bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 function canonicalPath(env: Bindings, key: string): string {
   return `/${awsEncode(bucket(env))}/${key.split("/").map(awsEncode).join("/")}`;
 }
@@ -110,18 +118,27 @@ export async function createPresignedPut(
   key: string,
   expiresInSeconds: number,
   issuedAt = new Date(),
+  sha256Hex?: string,
 ): Promise<PresignedPut> {
   const contentType = "application/octet-stream";
   const ifNoneMatch = "*";
   const cacheControl = "public, max-age=31536000, immutable";
-  const presigned = await createPresignedRequest(env, key, "PUT", expiresInSeconds, {
+  const checksum = sha256Hex ? base64FromHex(sha256Hex) : undefined;
+  const requestHeaders: Record<string, string> = {
     "content-type": contentType,
     "if-none-match": ifNoneMatch,
     "cache-control": cacheControl,
-  }, issuedAt);
+  };
+  if (checksum) requestHeaders["x-amz-checksum-sha256"] = checksum;
+  const presigned = await createPresignedRequest(env, key, "PUT", expiresInSeconds, requestHeaders, issuedAt);
   return {
     ...presigned,
-    headers: { "Content-Type": contentType, "If-None-Match": ifNoneMatch, "Cache-Control": cacheControl },
+    headers: {
+      "Content-Type": contentType,
+      "If-None-Match": ifNoneMatch,
+      "Cache-Control": cacheControl,
+      ...(checksum ? { "x-amz-checksum-sha256": checksum } : {}),
+    },
   };
 }
 

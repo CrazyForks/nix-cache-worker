@@ -137,12 +137,14 @@ write_direct_curl_config() {
   local content_type="$3"
   local if_none_match="$4"
   local cache_control="$5"
-  local nar_file="$6"
+  local checksum_sha256="$6"
+  local nar_file="$7"
 
   [[ "$upload_url" =~ ^https://[[:xdigit:]]{32}\.r2\.cloudflarestorage\.com/.*/_nix_uploads/ ]] || die "direct upload returned an unexpected R2 staging URL"
   [[ "$content_type" == "application/octet-stream" ]] || die "direct upload returned an unexpected Content-Type"
   [[ "$if_none_match" == "*" ]] || die "direct upload returned an unexpected If-None-Match value"
   [[ "$cache_control" == "public, max-age=31536000, immutable" ]] || die "direct upload returned an unexpected Cache-Control value"
+  [[ -n "$checksum_sha256" ]] || die "direct upload returned an unexpected SHA-256 checksum"
 
   : > "$config_file"
   chmod 600 "$config_file"
@@ -152,6 +154,7 @@ write_direct_curl_config() {
   curl_config_line "$config_file" 'header' "Content-Type: $content_type"
   curl_config_line "$config_file" 'header' "If-None-Match: $if_none_match"
   curl_config_line "$config_file" 'header' "Cache-Control: $cache_control"
+  curl_config_line "$config_file" 'header' "x-amz-checksum-sha256: $checksum_sha256"
   curl_config_line "$config_file" 'upload-file' "$nar_file"
 }
 
@@ -224,7 +227,7 @@ complete_upload() {
 upload_nar() {
   local nar_key="$1"
   local nar_file="$2"
-  local nar_size nar_sha256 session already_exists upload_id upload_url content_type if_none_match cache_control
+  local nar_size nar_sha256 session already_exists upload_id upload_url content_type if_none_match cache_control checksum_sha256
   local direct_config response_file attempt status
 
   nar_size="$(wc -c < "$nar_file" | tr -d '[:space:]')"
@@ -246,10 +249,11 @@ upload_nar() {
   content_type="$(jq --exit-status --raw-output '.uploadHeaders["Content-Type"] // empty' <<< "$session")" || die "direct upload response did not contain Content-Type"
   if_none_match="$(jq --exit-status --raw-output '.uploadHeaders["If-None-Match"] // empty' <<< "$session")" || die "direct upload response did not contain If-None-Match"
   cache_control="$(jq --exit-status --raw-output '.uploadHeaders["Cache-Control"] // empty' <<< "$session")" || die "direct upload response did not contain Cache-Control"
-  [[ -n "$upload_url" && -n "$content_type" && -n "$if_none_match" && -n "$cache_control" ]] || die "direct upload response was incomplete"
+  checksum_sha256="$(jq --exit-status --raw-output '.uploadHeaders["x-amz-checksum-sha256"] // empty' <<< "$session")" || die "direct upload response did not contain SHA-256 checksum"
+  [[ -n "$upload_url" && -n "$content_type" && -n "$if_none_match" && -n "$cache_control" && -n "$checksum_sha256" ]] || die "direct upload response was incomplete"
 
   direct_config="$temporary_directory/direct-$nar_size-$nar_sha256.curl"
-  write_direct_curl_config "$direct_config" "$upload_url" "$content_type" "$if_none_match" "$cache_control" "$nar_file"
+  write_direct_curl_config "$direct_config" "$upload_url" "$content_type" "$if_none_match" "$cache_control" "$checksum_sha256" "$nar_file"
   response_file="$temporary_directory/direct-response"
   for ((attempt = 0; attempt <= retry_count; attempt++)); do
     status="$(curl_status "$response_file" --config "$direct_config")"
