@@ -126,14 +126,15 @@ async function discardExpiredNarinfoReservation(
 export async function handleNarinfoPut(c: Context<AppEnv>): Promise<Response> {
   const key = normalizeKeyFromUrl(new URL(c.req.url));
   if (kindForKey(key) !== "narinfo") throw new AppError("invalid_path", "The narinfo route only accepts .narinfo objects", 404);
-  const bodyCopy = c.req.raw.clone();
-  const parsed = parseNarInfo(await bodyCopy.text());
+  const body = await c.req.text();
+  const parsed = parseNarInfo(body);
   await reserveNarinfoReference(c, key, parsed.narKey, parsed.storePath);
   const narObject = await c.env.CACHE_BUCKET.head(parsed.narKey);
   if (!narObject) {
     throw new AppError("missing_nar_dependency", "The narinfo references a missing NAR", 424, { narKey: parsed.narKey });
   }
-  const result = await putImmutableObject(c.env, key, "narinfo", c.req.raw, { allowPending: true });
+  const request = new Request(c.req.url, { method: "PUT", headers: c.req.raw.headers, body });
+  const result = await putImmutableObject(c.env, key, "narinfo", request, { allowPending: true });
   return new Response(null, { status: result.duplicate ? 204 : 201, headers: { ETag: result.object.httpEtag } });
 }
 
