@@ -222,6 +222,14 @@ if [[ "$largest_client_nar_size" -le $((100 * 1024 * 1024)) ]]; then
 fi
 
 small_narinfo_key="$(basename "$small_store_path").narinfo"
+if ! aws s3api head-object \
+  --bucket nix-cache-testing \
+  --key "$small_narinfo_key" \
+  --endpoint-url "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+  >/dev/null; then
+  printf 'The direct R2 HEAD could not find the published small narinfo: %s\n' "$small_narinfo_key" >&2
+  exit 1
+fi
 small_nar_key="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/$small_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
 if [[ -z "$small_nar_key" ]]; then
   printf 'The direct small NAR upload did not publish a usable narinfo\n' >&2
