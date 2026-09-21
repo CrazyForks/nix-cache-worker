@@ -222,6 +222,23 @@ if [[ "$largest_client_nar_size" -le $((100 * 1024 * 1024)) ]]; then
 fi
 
 small_narinfo_key="$(basename "$small_store_path").narinfo"
+if ! aws s3api head-object \
+  --bucket nix-cache-testing \
+  --key "$small_narinfo_key" \
+  --endpoint-url "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+  >/dev/null; then
+  printf 'The direct R2 HEAD could not find the published small narinfo: %s\n' "$small_narinfo_key" >&2
+  printf 'Matching R2 keys:\n' >&2
+  aws s3api list-objects-v2 \
+    --bucket nix-cache-testing \
+    --prefix "${small_narinfo_key%%.narinfo}" \
+    --endpoint-url "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+    --query 'Contents[].Key' --output text >&2 || true
+  printf 'Matching D1 rows:\n' >&2
+  npx wrangler d1 execute nix-cache-testing --remote --config wrangler.integration.generated.jsonc \
+    --command "SELECT r2_key, kind, state, etag, size FROM objects WHERE r2_key = '$small_narinfo_key';" >&2 || true
+  exit 1
+fi
 small_nar_key="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/$small_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
 if [[ -z "$small_nar_key" ]]; then
   printf 'The direct small NAR upload did not publish a usable narinfo\n' >&2
