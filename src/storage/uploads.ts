@@ -117,6 +117,7 @@ export async function expireStaleUploadSession(
 export async function createUploadSession(
   env: Bindings,
   input: { key: string; size: number; sha256: string },
+  owner?: string,
 ): Promise<{ session: UploadSessionRow; presigned: Awaited<ReturnType<typeof createPresignedPut>> }> {
   const id = crypto.randomUUID();
   const createdAt = now();
@@ -124,12 +125,20 @@ export async function createUploadSession(
   const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
   const stagingKey = stagingKeyForSession(id);
   const presigned = await createPresignedPut(env, stagingKey, ttl, new Date(createdAt));
-  await env.DB.prepare(
+  const insert = env.DB.prepare(
     `INSERT INTO upload_sessions (
        id, r2_key, staging_key, kind, expected_size, expected_sha256, status,
        created_at, expires_at, updated_at
      ) VALUES (?, ?, ?, 'nar', ?, ?, 'issued', ?, ?, ?)`,
-  ).bind(id, input.key, stagingKey, input.size, input.sha256, createdAt, expiresAt, createdAt).run();
+  ).bind(id, input.key, stagingKey, input.size, input.sha256, createdAt, expiresAt, createdAt);
+  if (owner) {
+    await env.DB.batch([
+      insert,
+      env.DB.prepare("DELETE FROM write_claims WHERE r2_key = ? AND owner = ?").bind(input.key, owner),
+    ]);
+  } else {
+    await insert.run();
+  }
   const session = await getUploadSession(env, id);
   if (!session) throw new AppError("upload_session_failed", "The upload session could not be created", 503);
   return { session, presigned };

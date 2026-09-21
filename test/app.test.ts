@@ -178,6 +178,7 @@ describe("staging direct uploads", () => {
     expect(String(issuedBody.uploadUrl)).toContain("_nix_uploads");
     expect(String(issuedBody.uploadId)).toMatch(/^[0-9a-f-]{36}$/i);
     expect(await testEnv.DB.prepare("SELECT r2_key FROM objects WHERE r2_key = ?").bind("nar/direct.nar").first()).toBeNull();
+    expect(await testEnv.DB.prepare("SELECT r2_key FROM write_claims WHERE r2_key = ?").bind("nar/direct.nar").first()).toBeNull();
 
     const uploadId = String(issuedBody.uploadId);
     const stagingRead = await request(`/_nix_uploads/${uploadId}`, { headers: bearer("read-secret") });

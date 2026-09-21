@@ -81,7 +81,7 @@ uploadRoutes.post("/api/uploads", requireRole("write"), async (c) => {
       return c.json(sessionResponse(active, presigned), 200);
     }
 
-    const created = await createUploadSession(c.env, input);
+    const created = await createUploadSession(c.env, input, owner);
     return c.json(sessionResponse(created.session, created.presigned), 201);
   } finally {
     await releaseObjectWrite(c.env, input.key, owner);
