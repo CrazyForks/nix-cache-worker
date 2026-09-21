@@ -187,7 +187,7 @@ complete_upload() {
   local upload_id="$1"
   local nar_key="$2"
   local response_file="$temporary_directory/upload-complete.json"
-  local attempt status
+  local attempt status error_summary
 
   for ((attempt = 0; attempt <= retry_count; attempt++)); do
     status="$(api_request POST "$cache_url/api/uploads/$upload_id/complete" "$response_file")"
@@ -203,6 +203,19 @@ complete_upload() {
         retry_delay "$attempt"
         continue
       fi
+    fi
+    error_summary="$(jq --raw-output '
+      if type == "object" and (.error | type) == "object" then
+        [(.error.code // empty), (.error.message // empty), (.error.details.errorCode // empty)]
+        | map(select(type == "string" and length > 0))
+        | unique
+        | join(": ")
+      else
+        ""
+      end
+    ' "$response_file" 2>/dev/null || true)"
+    if [[ -n "$error_summary" ]]; then
+      die "could not complete direct upload $nar_key (HTTP $status; $error_summary)"
     fi
     die "could not complete direct upload $nar_key (HTTP $status)"
   done
