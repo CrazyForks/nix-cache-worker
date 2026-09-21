@@ -27,7 +27,8 @@ app.onError((error, c) => {
   const code = isAppError(error) || error instanceof AuthError ? error.code : "internal_error";
   const message = isAppError(error) || error instanceof AuthError ? error.message : "Internal server error";
   if (status >= 500) console.error(JSON.stringify({ event: "request_error", requestId, code, message: error instanceof Error ? error.message : String(error) }));
-  return c.json({ error: { code, message, requestId } }, status as 400);
+  const details = isAppError(error) && Object.keys(error.details).length > 0 ? { details: error.details } : {};
+  return c.json({ error: { code, message, requestId, ...details } }, status as 400);
 });
 
 app.get("/admin", (c) => adminPage(new URL(c.req.url).origin));
