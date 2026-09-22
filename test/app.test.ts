@@ -317,6 +317,17 @@ describe("staging direct uploads", () => {
 });
 
 describe("shared NAR reference protection", () => {
+  it("accepts multiple Nix signatures in one narinfo", async () => {
+    await uploadNarObject("nar/multi-signature.nar", "hello");
+    const response = await request("/multi-signature.narinfo", {
+      method: "PUT",
+      headers: bearer("write-secret"),
+      body: narInfoBody("nar/multi-signature.nar", "/nix/store/multi-signature")
+        .replace("References: \n", "Sig: cache.example.org:signature-one\nSig: cache.example.org:signature-two\nReferences: \n"),
+    });
+    expect(response.response.status).toBe(201);
+  });
+
   it("rolls back a new narinfo reference when an existing unindexed object conflicts", async () => {
     await uploadNarObject("nar/narinfo-race.nar", "hello");
     await testEnv.CACHE_BUCKET.put("narinfo-race.narinfo", narInfoBody("nar/narinfo-race.nar", "/nix/store/existing"));

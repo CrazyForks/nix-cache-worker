@@ -15,7 +15,7 @@ export function parseNarInfo(text: string): ParsedNarInfo {
     if (separator <= 0) throw new AppError("invalid_narinfo", "The narinfo contains a malformed field", 422);
     const name = line.slice(0, separator);
     const value = line.slice(separator + 1).trim();
-    if (fields.has(name)) throw new AppError("invalid_narinfo", `The narinfo contains a duplicate ${name} field`, 422);
+    if (fields.has(name) && name !== "Sig") throw new AppError("invalid_narinfo", `The narinfo contains a duplicate ${name} field`, 422);
     fields.set(name, value);
   }
   const requiredFields = ["URL", "StorePath", "Compression", "FileHash", "FileSize", "NarHash", "NarSize", "References"];
