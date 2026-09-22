@@ -51,6 +51,14 @@ function awsEncode(value: string): string {
   return encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
+function base64FromHex(value: string): string {
+  const bytes = new Uint8Array(value.length / 2);
+  for (let index = 0; index < bytes.length; index += 1) bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 function canonicalPath(env: Bindings, key: string): string {
   return `/${awsEncode(bucket(env))}/${key.split("/").map(awsEncode).join("/")}`;
 }
@@ -110,18 +118,27 @@ export async function createPresignedPut(
   key: string,
   expiresInSeconds: number,
   issuedAt = new Date(),
+  sha256Hex?: string,
 ): Promise<PresignedPut> {
   const contentType = "application/octet-stream";
   const ifNoneMatch = "*";
   const cacheControl = "public, max-age=31536000, immutable";
-  const presigned = await createPresignedRequest(env, key, "PUT", expiresInSeconds, {
+  const checksum = sha256Hex ? base64FromHex(sha256Hex) : undefined;
+  const requestHeaders: Record<string, string> = {
     "content-type": contentType,
     "if-none-match": ifNoneMatch,
     "cache-control": cacheControl,
-  }, issuedAt);
+  };
+  if (checksum) requestHeaders["x-amz-checksum-sha256"] = checksum;
+  const presigned = await createPresignedRequest(env, key, "PUT", expiresInSeconds, requestHeaders, issuedAt);
   return {
     ...presigned,
-    headers: { "Content-Type": contentType, "If-None-Match": ifNoneMatch, "Cache-Control": cacheControl },
+    headers: {
+      "Content-Type": contentType,
+      "If-None-Match": ifNoneMatch,
+      "Cache-Control": cacheControl,
+      ...(checksum ? { "x-amz-checksum-sha256": checksum } : {}),
+    },
   };
 }
 
@@ -133,6 +150,49 @@ export async function createPresignedRead(
   issuedAt = new Date(),
 ): Promise<PresignedRead> {
   return createPresignedRequest(env, key, method, expiresInSeconds, {}, issuedAt);
+}
+
+/**
+ * Copy an object inside R2 through the S3-compatible CopyObject operation.
+ * This keeps large promotions inside R2 instead of streaming the bytes through
+ * the Worker request that validates the staging object.
+ */
+export async function copyR2Object(env: Bindings, sourceKey: string, destinationKey: string, issuedAt = new Date()): Promise<void> {
+  const target = endpoint(env);
+  const host = target.host;
+  const path = canonicalPath(env, destinationKey);
+  const copySource = `/${awsEncode(bucket(env))}/${sourceKey.split("/").map(awsEncode).join("/")}`;
+  const headers: Record<string, string> = {
+    host,
+    "x-amz-copy-source": copySource,
+    "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+    "x-amz-date": timestampParts(issuedAt).long,
+  };
+  const signedHeaderNames = Object.keys(headers).sort();
+  const signedHeaders = signedHeaderNames.join(";");
+  const canonicalHeaders = signedHeaderNames
+    .map((name) => `${name}:${canonicalHeaderValue(headers[name] ?? "")}`)
+    .join("\n") + "\n";
+  const canonicalRequest = ["PUT", path, "", canonicalHeaders, signedHeaders, "UNSIGNED-PAYLOAD"].join("\n");
+  const canonicalRequestHash = await sha256(canonicalRequest);
+  const { short, long } = timestampParts(issuedAt);
+  const scope = `${short}/${AWS_REGION}/${AWS_SERVICE}/aws4_request`;
+  const credential = `${accessKeyId(env)}/${scope}`;
+  const dateKey = await hmac(new TextEncoder().encode(`AWS4${secretAccessKey(env)}`), short);
+  const regionKey = await hmac(dateKey, AWS_REGION);
+  const serviceKey = await hmac(regionKey, AWS_SERVICE);
+  const signingKey = await hmac(serviceKey, "aws4_request");
+  const signature = hex(await hmac(signingKey, `AWS4-HMAC-SHA256\n${long}\n${scope}\n${canonicalRequestHash}`));
+  const response = await fetch(`${target.origin}${path}`, {
+    method: "PUT",
+    headers: {
+      ...headers,
+      authorization: `AWS4-HMAC-SHA256 Credential=${credential}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    },
+  });
+  if (!response.ok) {
+    throw new AppError("r2_copy_failed", `R2 could not promote the staging object (HTTP ${response.status})`, 503);
+  }
 }
 
 async function createPresignedRequest(

@@ -205,6 +205,17 @@ done < <(find "$expected_file_cache" -maxdepth 1 -type f -name '*.narinfo' -prin
 sort -u "$cleanup_keys_file" > "$cleanup_keys_file.sorted"
 mv "$cleanup_keys_file.sorted" "$cleanup_keys_file"
 
+narinfo_key_for_store_path() {
+  local store_path="$1" expected_narinfo_file
+  while IFS= read -r expected_narinfo_file; do
+    if grep -F -x -q "StorePath: $store_path" "$expected_narinfo_file"; then
+      basename "$expected_narinfo_file"
+      return 0
+    fi
+  done < <(find "$expected_file_cache" -maxdepth 1 -type f -name '*.narinfo' -print | sort)
+  return 1
+}
+
 client_output="$temporary_directory/nix-cache-upload.log"
 printf 'Publishing the small and over-100 MiB paths with nix-cache-upload...\n'
 NIX_CACHE_WRITE_TOKEN="$NIX_CACHE_TESTING_WRITE_TOKEN" \
@@ -215,13 +226,16 @@ NIX_CACHE_WRITE_TOKEN="$NIX_CACHE_TESTING_WRITE_TOKEN" \
     --tag integration=real-nix \
     "$small_store_path" "$large_store_path" | tee "$client_output"
 
-largest_client_nar_size="$(awk -F'[()]' '/^Preparing direct upload for / { value = $2; sub(/ bytes$/, "", value); if (value > largest) largest = value } END { print largest + 0 }' "$client_output")"
+largest_client_nar_size="$(awk -F'[()]' '/^Preparing direct upload for / { value = $2; sub(/ bytes$/, "", value); if ((value + 0) > (largest + 0)) largest = value } END { print largest + 0 }' "$client_output")"
 if [[ "$largest_client_nar_size" -le $((100 * 1024 * 1024)) ]]; then
   printf 'nix-cache-upload did not produce an over-100 MiB direct NAR\n' >&2
   exit 1
 fi
 
-small_narinfo_key="$(basename "$small_store_path").narinfo"
+small_narinfo_key="$(narinfo_key_for_store_path "$small_store_path")" || {
+  printf 'Could not find the generated small narinfo key\n' >&2
+  exit 1
+}
 small_nar_key="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/$small_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
 if [[ -z "$small_nar_key" ]]; then
   printf 'The direct small NAR upload did not publish a usable narinfo\n' >&2
@@ -238,7 +252,10 @@ if [[ "$small_downloaded_sha256" != "$small_expected_sha256" ]]; then
   exit 1
 fi
 
-large_narinfo_key="$(basename "$large_store_path").narinfo"
+large_narinfo_key="$(narinfo_key_for_store_path "$large_store_path")" || {
+  printf 'Could not find the generated large narinfo key\n' >&2
+  exit 1
+}
 large_nar_key="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/$large_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
 if [[ -z "$large_nar_key" ]]; then
   printf 'nix-cache-upload did not publish the large narinfo\n' >&2

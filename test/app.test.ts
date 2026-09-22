@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { app } from "../src/app";
 import type { Bindings } from "../src/env";
@@ -22,7 +22,23 @@ const testEnv = {
   DIRECT_DOWNLOAD_URL_TTL_SECONDS: "900",
 } as Bindings;
 
+const originalFetch = globalThis.fetch;
+
 beforeAll(async () => {
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (request.method === "PUT" && url.hostname.endsWith(".r2.cloudflarestorage.com")) {
+      const segments = url.pathname.split("/").filter(Boolean);
+      const key = segments.slice(1).map((segment) => decodeURIComponent(segment)).join("/");
+      if (request.headers.get("If-None-Match") === "*" && await testEnv.CACHE_BUCKET.head(key)) {
+        return new Response(null, { status: 412 });
+      }
+      await testEnv.CACHE_BUCKET.put(key, await request.arrayBuffer());
+      return new Response(null, { status: 201 });
+    }
+    return originalFetch(input, init);
+  };
   const schema = `
     PRAGMA foreign_keys = ON;
     DROP TABLE IF EXISTS artifact_version_pending_members;
@@ -68,6 +84,10 @@ beforeAll(async () => {
     "nar/direct.nar",
     "nar/bad.nar",
   ].map((key) => testEnv.CACHE_BUCKET.delete(key)));
+});
+
+afterAll(() => {
+  globalThis.fetch = originalFetch;
 });
 
 async function request(path: string, init: RequestInit = {}): Promise<{ response: Response; waitUntil: Promise<unknown>[] }> {
@@ -178,6 +198,7 @@ describe("staging direct uploads", () => {
     expect(String(issuedBody.uploadUrl)).toContain("_nix_uploads");
     expect(String(issuedBody.uploadId)).toMatch(/^[0-9a-f-]{36}$/i);
     expect(await testEnv.DB.prepare("SELECT r2_key FROM objects WHERE r2_key = ?").bind("nar/direct.nar").first()).toBeNull();
+    expect(await testEnv.DB.prepare("SELECT r2_key FROM write_claims WHERE r2_key = ?").bind("nar/direct.nar").first()).toBeNull();
 
     const uploadId = String(issuedBody.uploadId);
     const stagingRead = await request(`/_nix_uploads/${uploadId}`, { headers: bearer("read-secret") });

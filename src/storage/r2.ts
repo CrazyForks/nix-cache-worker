@@ -4,7 +4,7 @@ import { cacheControlFor, contentTypeFor, type ObjectKind } from "../domain/keys
 import { hashStream } from "../domain/sha256";
 import { emitMetric } from "../observability";
 import { getObject, upsertObject } from "./db";
-import { createPresignedRead, directDownloadTtl } from "./presign";
+import { createPresignedPut, createPresignedRead, directDownloadTtl, directUploadTtl } from "./presign";
 
 const WRITE_CLAIM_TTL_MS = 15 * 60_000;
 const WRITE_CLAIM_CLEANUP_INTERVAL_MS = 60_000;
@@ -192,14 +192,33 @@ export async function putImmutableObject(
     }
 
     if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
-    const [hashBody, uploadBody] = request.body.tee();
-    const hashPromise = hashStream(hashBody);
     const onlyIf: R2Conditional = { etagDoesNotMatch: "*" };
-    const object = await env.CACHE_BUCKET.put(key, uploadBody, {
-      onlyIf,
-      httpMetadata: httpMetadataFor(kind),
-    });
-    const incoming = await hashPromise;
+    let object: R2Object | null;
+    let incoming: { sha256: string; size: number };
+    if (kind === "narinfo") {
+      // Narinfo files are small. Use the same signed S3 write path as direct
+      // uploads; it avoids coupling an incoming Worker request stream to the
+      // R2 binding's conditional write lifetime.
+      const body = await request.arrayBuffer();
+      incoming = await hashStream(new Response(body).body);
+      const presigned = await createPresignedPut(env, key, directUploadTtl(env), new Date(), incoming.sha256);
+      const response = await fetch(presigned.url, {
+        method: "PUT",
+        headers: presigned.headers,
+        body,
+      });
+      if (response.status === 412) object = null;
+      else if (!response.ok) throw new AppError("r2_put_failed", `R2 could not store the ${kind} object (HTTP ${response.status})`, 503);
+      else object = await env.CACHE_BUCKET.head(key);
+    } else {
+      const [hashBody, uploadBody] = request.body.tee();
+      const hashPromise = hashStream(hashBody);
+      object = await env.CACHE_BUCKET.put(key, uploadBody, {
+        onlyIf,
+        httpMetadata: httpMetadataFor(kind),
+      });
+      incoming = await hashPromise;
+    }
     if (object) {
       if (indexed?.state === "ready" && (
         !indexed.sha256 || indexed.size !== incoming.size || indexed.sha256 !== incoming.sha256
