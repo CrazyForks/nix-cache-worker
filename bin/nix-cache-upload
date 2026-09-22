@@ -274,7 +274,7 @@ publish_narinfo() {
   local narinfo_key="$1"
   local narinfo_file="$2"
   local response_file="$temporary_directory/narinfo-response"
-  local attempt status
+  local attempt status error_summary
 
   printf 'Publishing narinfo: %s\n' "$narinfo_key"
   for ((attempt = 0; attempt <= retry_count; attempt++)); do
@@ -285,6 +285,19 @@ publish_narinfo() {
     if retryable_status "$status" && [[ "$attempt" -lt "$retry_count" ]]; then
       retry_delay "$attempt"
       continue
+    fi
+    error_summary="$(jq --raw-output '
+      if type == "object" and (.error | type) == "object" then
+        [(.error.code // empty), (.error.message // empty), (.error.details.narKey // empty)]
+        | map(select(type == "string" and length > 0))
+        | unique
+        | join(": ")
+      else
+        ""
+      end
+    ' "$response_file" 2>/dev/null || true)"
+    if [[ -n "$error_summary" ]]; then
+      die "could not publish narinfo $narinfo_key (HTTP $status; $error_summary)"
     fi
     die "could not publish narinfo $narinfo_key (HTTP $status)"
   done
