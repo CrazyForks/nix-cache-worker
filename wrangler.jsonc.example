@@ -12,6 +12,8 @@
     "NIX_PUBLIC_SIGN_KEY": "",
     "R2_ACCOUNT_ID": "replace-with-cloudflare-account-id",
     "R2_BUCKET_NAME": "replace-with-r2-bucket-name",
+    // Optional public R2 Custom Domain used by the home-page guide for anonymous reads.
+    "R2_PUBLIC_URL": "",
     "R2_S3_ENDPOINT": "",
     // Direct-upload URLs target random staging keys and are cleaned after expiry.
     "DIRECT_UPLOAD_URL_TTL_SECONDS": "3600",

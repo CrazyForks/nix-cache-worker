@@ -34,7 +34,8 @@ cp wrangler.jsonc.example wrangler.jsonc
 ```
 
 Set the Worker name, R2 bucket, D1 database ID, account ID, presigned URL
-TTLs, cache-info values, and optional public Nix signing key.
+TTLs, cache-info values, optional R2 Custom Domain URL, and optional public Nix
+signing key.
 
 ## 2. Clear the old deployment
 
@@ -77,8 +78,9 @@ logs, and persistent browser storage.
 ## 5. Choose a read entry point
 
 If `READ_TOKEN` is empty, either use the Worker origin (which returns
-presigned redirects) or attach an R2 Custom Domain. The Custom Domain is the
-lowest-cost anonymous download path because it avoids Worker invocations.
+presigned redirects) or attach an R2 Custom Domain. Set `R2_PUBLIC_URL` to the
+Custom Domain URL so the public home-page guide recommends the lowest-cost
+anonymous download path. The Custom Domain avoids Worker invocations.
 
 If `READ_TOKEN` is non-empty, do not enable a public R2 Custom Domain. All
 cache reads must enter through the Worker so it can enforce the read token.

@@ -47,10 +47,11 @@ domains, signing, verification, and upgrade guidance.
 
 ## Using the cache
 
-Reads are public by default. Nix publishers use the Worker write token through
-a mode-0600 netrc entry, while management operations use the admin token. The
-public home page shows the NixOS and nix-darwin client configuration example
-for the deployed origin.
+Reads are public by default. Nix publishers use the bundled staging uploader
+with the Worker write token, while management operations use the admin token.
+When `R2_PUBLIC_URL` is configured and `READ_TOKEN` is empty, the public home
+page recommends that R2 Custom Domain for anonymous reads; otherwise it uses
+the Worker origin.
 
 The admin console is available at `/admin`. It manages package versions,
 retention rules, pins, garbage collection, and persistent deletion jobs.

@@ -435,8 +435,19 @@ describe("shared NAR reference protection", () => {
 
 describe("static pages", () => {
   it("renders the public cache setup page", async () => {
-    const response = homePage("", "https://cache.test");
+    const response = homePage("", "https://cache.test", "", "https://r2.test");
     expect(response.status).toBe(200);
-    expect(await response.text()).toContain("cache.nixos.org");
+    const html = await response.text();
+    expect(html).toContain("cache.nixos.org");
+    expect(html).toContain("https://r2.test");
+    expect(html).toContain("Anonymous reads use the configured R2 Custom Domain directly");
+    expect(html).toContain("r2.test:&lt;public-signing-key&gt;");
+  });
+
+  it("keeps the home-page guide on the Worker when READ_TOKEN is configured", async () => {
+    const html = await (await homePage("", "https://cache.test", "read-secret", "https://r2.test")).text();
+    expect(html).toContain("https://cache.test");
+    expect(html).not.toContain("https://r2.test");
+    expect(html).toContain("Reads use the Worker so it can enforce the configured read token");
   });
 });

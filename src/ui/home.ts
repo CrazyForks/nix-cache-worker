@@ -19,6 +19,18 @@ function cacheHost(origin: string): string {
   }
 }
 
+function normalizeOrigin(value: string | undefined): string | undefined {
+  const candidate = value?.trim().replace(/\/+$/, "");
+  if (!candidate) return undefined;
+  try {
+    const url = new URL(candidate);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+    return url.origin;
+  } catch {
+    return undefined;
+  }
+}
+
 function productFooter(): string {
   return `<footer class="site-footer">Powered by <a href="${escapeHtml(DEFAULT_REPOSITORY_URL)}" target="_blank" rel="noreferrer">NixCacheWorker</a></footer>`;
 }
@@ -26,11 +38,21 @@ function productFooter(): string {
 export function homePage(
   publicSigningKey?: string,
   publicOrigin = DEFAULT_CACHE_ORIGIN,
+  readToken?: string,
+  r2PublicOrigin?: string,
 ): Response {
-  const origin = publicOrigin.replace(/\/+$/, "") || DEFAULT_CACHE_ORIGIN;
+  const workerOrigin = normalizeOrigin(publicOrigin) || DEFAULT_CACHE_ORIGIN;
+  const directR2Origin = !readToken ? normalizeOrigin(r2PublicOrigin) : undefined;
+  const origin = directR2Origin || workerOrigin;
+  const usesDirectR2 = Boolean(directR2Origin);
   const signingKey = publicSigningKey || `${cacheHost(origin)}:<public-signing-key>`;
   const publicKey = escapeHtml(signingKey);
   const footer = productFooter();
+  const readModeDescription = usesDirectR2
+    ? "Anonymous reads use the configured R2 Custom Domain directly, avoiding a Worker request for each download."
+    : readToken
+      ? "Reads use the Worker so it can enforce the configured read token."
+      : "This example uses the Worker URL, which redirects cache reads to R2.";
   const nixModuleConfig = escapeHtml(`substituters = lib.mkForce [
   "https://cache.nixos.org"
   "${origin}"
@@ -95,14 +117,14 @@ trusted-public-keys = lib.mkForce [
     <header class="home-nav"><a class="brand" href="/">NIX CACHE WORKER</a><a class="admin-link" href="/admin">Admin console <span aria-hidden="true">↗</span></a></header>
     <main class="home-main">
       <section class="hero">
-        <div><div class="eyebrow">Public Nix binary cache</div><h1>Stop building in production.</h1><p class="hero-copy">Build your Nix artifacts in CI, push them to your private cache, and deploy instantly.</p></div>
+        <div><div class="eyebrow">Public Nix binary cache</div><h1>Stop building in production.</h1><p class="hero-copy">Build your Nix artifacts in CI, push them to your cache, and deploy instantly.</p></div>
         <div class="hero-mark" aria-hidden="true"><div class="mark-core">NIX</div></div>
       </section>
       <section class="guide" aria-labelledby="guide-title">
-        <div class="guide-head"><div><div class="eyebrow">Getting started</div><h2 id="guide-title">Add the cache to NixOS or nix-darwin</h2><p class="subtle">Keep your existing cache.nixos.org entry and add this cache alongside it.</p></div><span class="guide-label">Client setup</span></div>
+        <div class="guide-head"><div><div class="eyebrow">Getting started</div><h2 id="guide-title">Add the cache to NixOS or nix-darwin</h2><p class="subtle">Keep your existing cache.nixos.org entry and add this cache alongside it. ${readModeDescription}</p></div><span class="guide-label">Client setup</span></div>
         <div class="steps">
           <article class="step wide"><span class="step-index">1</span><h3>Use the full module configuration</h3><p>This example intentionally keeps the official cache and its existing signing key. Replace only the placeholder with the key you already use for cache.nixos.org.</p><div class="code-wrap"><pre>${nixModuleConfig}</pre></div></article>
-          <article class="step"><span class="step-index">2</span><h3>Verify the public key</h3><p>Worker-signed narinfos use this public key:</p><div class="key-line">${publicKey}</div></article>
+          <article class="step"><span class="step-index">2</span><h3>Verify the public key</h3><p>Trust narinfos signed with this public key. The Worker does not sign narinfos:</p><div class="key-line">${publicKey}</div></article>
           <article class="step"><span class="step-index">3</span><h3>Apply and build normally</h3><p>After deploying the module, continue using your normal Nix commands. Existing substituters remain available.</p></article>
         </div>
         <div class="note"><strong>About <code>lib.mkForce</code>:</strong> it makes this module's complete lists authoritative. Keep the official cache entry and its real key in the lists as shown; do not replace them with only the Worker values.</div>

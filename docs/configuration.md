@@ -19,6 +19,7 @@ DEFAULT_WANT_MASS_QUERY=1
 DEFAULT_RETENTION_DAYS=7
 R2_ACCOUNT_ID=<cloudflare-account-id>
 R2_BUCKET_NAME=<cache-bucket-name>
+R2_PUBLIC_URL=<optional-https-r2-custom-domain-url>
 R2_S3_ENDPOINT=<optional-https-r2-s3-endpoint>
 DIRECT_UPLOAD_URL_TTL_SECONDS=3600
 DIRECT_DOWNLOAD_URL_TTL_SECONDS=900
@@ -52,6 +53,11 @@ Custom Domain may be used as a direct anonymous entry point. When it is
 non-empty, `GET` and `HEAD` cache paths require read, write, or admin
 authentication and always redirect through the Worker. Do not expose a public
 R2 Custom Domain in that mode.
+
+`R2_PUBLIC_URL` is the public HTTPS URL of the optional R2 Custom Domain. When
+it is configured and `READ_TOKEN` is empty, the home-page NixOS and nix-darwin
+guide uses this URL as the substituter. It is a read endpoint only; publishing
+commands must continue to use the Worker URL.
 
 Read redirects use `Cache-Control: no-store`; final NAR and narinfo objects use
 immutable one-year metadata, while `/nix-cache-info` uses a five-minute client

@@ -178,7 +178,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
         <div class="stat"><div class="stat-label">Packages</div><div class="stat-value" id="statPackages">—</div></div>
         <div class="stat"><div class="stat-label">Versions</div><div class="stat-value" id="statVersions">—</div></div>
         <div class="stat"><div class="stat-label">Pinned versions</div><div class="stat-value" id="statPinned">—</div></div>
-        <div class="stat"><div class="stat-label">Cache objects</div><div class="stat-value" id="statObjects">—</div></div>
+        <div class="stat"><div class="stat-label">Indexed objects</div><div class="stat-value" id="statObjects">—</div></div>
         <div class="stat"><div class="stat-label">Indexed bytes</div><div class="stat-value" id="statBytes">—</div></div>
       </section>
 
@@ -189,7 +189,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
       </section>
 
       <section class="panel" id="policies">
-        <div class="panel-head"><div><h2>Retention rules</h2><p class="subtle">Build readable where / group by / action rules for automatic garbage collection.</p></div><button class="button primary" id="togglePolicyEditor" type="button">Create rule</button></div>
+        <div class="panel-head"><div><h2>Automatic GC retention rules</h2><p class="subtle">Define which versions match, how they are grouped, and when automatic garbage collection may remove them.</p></div><button class="button primary" id="togglePolicyEditor" type="button">Create rule</button></div>
         <div class="rule-editor hidden" id="policyEditor">
           <div class="rule-editor-head"><div><div class="eyebrow">Rule builder</div><h3 id="policyEditorTitle">Create retention rule</h3><p class="subtle">Conditions are combined with AND. Grouping controls where newest versions are counted.</p></div><button class="button" id="cancelPolicy" type="button">Close</button></div>
           <div class="field full"><label for="policy_name">Rule name</label><input id="policy_name" placeholder="stable-linux-builds"></div>
@@ -207,7 +207,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
           </div>
 
           <div class="rule-block">
-            <div class="rule-block-head"><div><span class="step-index">3</span><h3>Set retention actions</h3><p>Enable any combination. Priority is left to right: earlier actions take precedence over later ones. Pins always override automatic GC.</p></div></div>
+            <div class="rule-block-head"><div><span class="step-index">3</span><h3>Set retention actions</h3><p>These controls are combined: keep-newest and pinned versions are protected from automatic GC; capacity may make older versions eligible before the duration expires.</p></div></div>
             <div class="action-grid">
               <div class="action-card" id="lastNCard"><label class="action-toggle"><input id="enableLastN" type="checkbox"> Keep newest versions</label><div class="action-input"><input id="policy_last_n" type="number" min="0" placeholder="3" disabled><span class="unit">versions per group</span></div><p>Protected versions are never removed by automatic GC.</p></div>
               <div class="action-card" id="capacityCard"><label class="action-toggle"><input id="enableCapacity" type="checkbox"> Allow up to</label><div class="action-input"><input id="policy_capacity" type="number" min="0" placeholder="20" disabled><span class="unit">versions per group</span></div><p>Over-capacity versions may be removed before the duration expires.</p></div>
@@ -220,13 +220,13 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
         <div class="policy-list" id="policyList"></div>
       </section>
 
-      <section class="panel" id="settings"><div class="panel-head"><div><h2>Deployment settings</h2><p class="subtle">Cache-info values and default retention are deployment environment variables. Change them with Wrangler and redeploy.</p></div></div></section>
+      <section class="panel" id="settings"><div class="panel-head"><div><h2>Deployment settings</h2><p class="subtle">Cache-info values, the optional R2 public URL, and default retention are deployment environment variables. Change them with Wrangler and redeploy.</p></div></div></section>
       <section class="panel publisher-panel" id="publishing">
-        <div class="panel-head"><div><div class="eyebrow">For publishers</div><h2>CI publishing</h2><p class="subtle">Publish build outputs with the bundled staging direct-upload client. Keep the write token in your CI secret store.</p></div><span class="connected">Write access</span></div>
+        <div class="panel-head"><div><div class="eyebrow">For publishers</div><h2>CI publishing</h2><p class="subtle">Use the Worker URL for publishing. The optional R2 Custom Domain is for anonymous downloads only. Keep the write token in your CI secret store.</p></div><span class="connected">CI publisher</span></div>
         <div class="publisher-grid">
-          <article class="publisher-card"><span class="publisher-step">1</span><h3>Provide netrc credentials</h3><p>Create a mode-0600 netrc entry in the CI job. The password is the Worker write token and must never be committed.</p><pre class="publisher-code">machine ${origin.replace(/^https?:\/\//, "")} login nix password &lt;WRITE_TOKEN&gt;</pre></article>
-          <article class="publisher-card"><span class="publisher-step">2</span><h3>Upload through staging</h3><p>Use <code>bin/nix-cache-upload</code>; NAR payloads must use staging direct upload and cannot be sent with ordinary Worker PUT.</p><pre class="publisher-code">NIX_CACHE_WRITE_TOKEN=&lt;WRITE_TOKEN&gt; bin/nix-cache-upload --to ${origin} --package acme --version ci-123 ./result</pre></article>
-          <article class="publisher-card wide"><span class="publisher-step">3</span><h3>Register the build version</h3><p>After uploading NARs and narinfos, send the complete version declaration. <code>narinfoKeys</code> lists uploaded narinfo keys, while <code>tags</code> and <code>retentionDays</code> are optional metadata.</p><pre class="publisher-code">curl -X PUT "${origin}/api/packages/acme/versions/2026.08.18" \
+          <article class="publisher-card"><span class="publisher-step">1</span><h3>Provide the write token</h3><p>Set <code>NIX_CACHE_WRITE_TOKEN</code> in the CI job, or pass <code>--token-file</code>. Keep the token in your CI secret store and never commit it.</p><pre class="publisher-code">export NIX_CACHE_WRITE_TOKEN=&lt;WRITE_TOKEN&gt;</pre></article>
+          <article class="publisher-card"><span class="publisher-step">2</span><h3>Upload through staging</h3><p>Run <code>bin/nix-cache-upload</code> against the Worker URL. NARs go to temporary private R2 staging keys; the client verifies and promotes them before publishing narinfo.</p><pre class="publisher-code">NIX_CACHE_WRITE_TOKEN=&lt;WRITE_TOKEN&gt; bin/nix-cache-upload --to ${origin} --package acme --version ci-123 ./result</pre></article>
+          <article class="publisher-card wide"><span class="publisher-step">3</span><h3>Version registration is automatic</h3><p>The bundled client publishes narinfos and registers the complete package/version declaration automatically. Use the API below only for a manual integration; <code>narinfoKeys</code> lists uploaded narinfo keys, while <code>tags</code> and <code>retentionDays</code> are optional metadata.</p><pre class="publisher-code">curl -X PUT "${origin}/api/packages/acme/versions/2026.08.18" \
   -H "Authorization: Bearer $WRITE_TOKEN" \
   -H "Content-Type: application/json" \
   --data '{

@@ -32,7 +32,7 @@ app.onError((error, c) => {
 });
 
 app.get("/admin", (c) => adminPage(new URL(c.req.url).origin));
-app.get("/", (c) => homePage(c.env.NIX_PUBLIC_SIGN_KEY, new URL(c.req.url).origin));
+app.get("/", (c) => homePage(c.env.NIX_PUBLIC_SIGN_KEY, new URL(c.req.url).origin, c.env.READ_TOKEN, c.env.R2_PUBLIC_URL));
 app.route("", adminRoutes);
 app.route("", versionRoutes);
 app.route("", uploadRoutes);

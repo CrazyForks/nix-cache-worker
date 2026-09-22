@@ -160,8 +160,9 @@ R2 buckets and D1 databases are Worker bindings and must be configured with Wran
 The public home page (`/`) opens with a client configuration guide containing
 the official `cache.nixos.org` entries alongside this cache and the configured
 `NIX_PUBLIC_SIGN_KEY`. When the public key variable is unset, the guide shows a
-placeholder. The authenticated console keeps operational and CI publishing
-instructions at the end of the page; the login page is unchanged.
+placeholder. Whether Nix requires signatures remains a user-side cache
+configuration choice. The authenticated console keeps operational and CI
+publishing instructions at the end of the page; the login page is unchanged.
 
 ## Packages, versions, and files
 
